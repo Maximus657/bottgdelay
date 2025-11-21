@@ -1,10 +1,11 @@
 import asyncio
 import logging
-import sqlite3
 import datetime
 import os
 import requests
 import sys
+import psycopg2
+from psycopg2.extras import DictCursor
 from typing import List, Optional, Union
 
 from aiogram import Bot, Dispatcher, F, types
@@ -20,23 +21,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ==============================================================================
-# 0. КОНФИГУРАЦИЯ И НАСТРОЙКИ (ОБНОВЛЕНО ДЛЯ DOCKER)
+# 0. КОНФИГУРАЦИЯ
 # ==============================================================================
 
-API_TOKEN = '8524498099:AAHTXkBHz3KDS-ux820VLjQP3N1vjKbBPtw'
-ADMIN_IDS = [883119315, 424647161] 
+# Берем из переменных окружения (Dokploy Environment)
+API_TOKEN = os.getenv('API_TOKEN')
+# Превращаем строку "id1,id2" в список чисел
+admin_ids_str = os.getenv('ADMIN_IDS', '')
+ADMIN_IDS = [int(x) for x in admin_ids_str.split(',')] if admin_ids_str else []
 
-# --- НАСТРОЙКА ПУТИ К БАЗЕ ДЛЯ DOCKER ---
-# Мы используем папку "data", которую в Dokploy подключили через Bind Mount (/app/data)
-DATA_DIR = "data"
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Полный путь к файлу базы данных
-DB_NAME = os.path.join(DATA_DIR, "label_system_pro.db")
-
-# Яндекс.Диск
-YANDEX_DISK_TOKEN = "y0__xD1sf2lqveAAhi1rjsg_bvwghVVrb4S_mJF7NDv90XWdC0AbRPkyQ"
+YANDEX_DISK_TOKEN = os.getenv('YANDEX_DISK_TOKEN')
 YANDEX_API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 YANDEX_UPLOAD_FOLDER = "label_bot_files"
 
@@ -60,7 +56,7 @@ ROLES_MAP = {
 ROLES_DISPLAY = {v: k for k, v in ROLES_MAP.items()}
 
 # ==============================================================================
-# 1. МОДУЛЬ РАБОТЫ С ЯНДЕКС.ДИСКОМ
+# 1. YANDEX DISK
 # ==============================================================================
 class YandexDiskService:
     def __init__(self, token, folder_name):
@@ -98,39 +94,85 @@ class YandexDiskService:
 ydisk = YandexDiskService(YANDEX_DISK_TOKEN, YANDEX_UPLOAD_FOLDER)
 
 # ==============================================================================
-# 2. МОДУЛЬ БАЗЫ ДАННЫХ
+# 2. POSTGRESQL DATABASE
 # ==============================================================================
 class Database:
-    def __init__(self, path):
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row 
-        self.cursor = self.conn.cursor()
-        self._init_tables()
+    def __init__(self, dsn):
+        self.dsn = dsn
+        # Подключаемся сразу, autocommit=True чтобы не делать conn.commit() каждый раз вручную
+        self.conn = psycopg2.connect(dsn)
+        self.conn.autocommit = True
+        self.init_db()
 
-    def _init_tables(self):
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)""")
-        
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS artists (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, manager_id INTEGER, first_release_date TEXT,
-            flag_contract INTEGER DEFAULT 0, flag_mm_profile INTEGER DEFAULT 0,
-            flag_mm_verify INTEGER DEFAULT 0, flag_yt_note INTEGER DEFAULT 0, flag_yt_link INTEGER DEFAULT 0
-        )""")
+    def get_cursor(self):
+        # DictCursor позволяет обращаться к полям по имени, как в sqlite row_factory
+        return self.conn.cursor(cursor_factory=DictCursor)
 
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS releases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, artist_id INTEGER, type TEXT, release_date TEXT, created_by INTEGER
-        )""")
+    def init_db(self):
+        with self.get_cursor() as cur:
+            # Пользователи (BIGINT для Telegram ID)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    name TEXT,
+                    role TEXT
+                )
+            """)
+            
+            # Артисты (SERIAL вместо AUTOINCREMENT)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS artists (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT,
+                    manager_id BIGINT,
+                    first_release_date TEXT,
+                    flag_contract INTEGER DEFAULT 0,
+                    flag_mm_profile INTEGER DEFAULT 0,
+                    flag_mm_verify INTEGER DEFAULT 0,
+                    flag_yt_note INTEGER DEFAULT 0,
+                    flag_yt_link INTEGER DEFAULT 0
+                )
+            """)
 
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT, assigned_to INTEGER, created_by INTEGER,
-            release_id INTEGER, parent_task_id INTEGER, deadline TEXT, status TEXT DEFAULT 'pending',
-            requires_file INTEGER DEFAULT 0, file_url TEXT, comment TEXT
-        )""")
+            # Релизы
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS releases (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT,
+                    artist_id INTEGER,
+                    type TEXT,
+                    release_date TEXT,
+                    created_by BIGINT
+                )
+            """)
 
-        self.cursor.execute("""CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, report_date TEXT, text TEXT
-        )""")
-        self.conn.commit()
+            # Задачи
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT,
+                    description TEXT,
+                    assigned_to BIGINT,
+                    created_by BIGINT,
+                    release_id INTEGER,
+                    parent_task_id INTEGER,
+                    deadline TEXT,
+                    status TEXT DEFAULT 'pending',
+                    requires_file INTEGER DEFAULT 0,
+                    file_url TEXT,
+                    comment TEXT
+                )
+            """)
+
+            # Отчеты
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    report_date TEXT,
+                    text TEXT
+                )
+            """)
         self._seed_admins()
 
     def _seed_admins(self):
@@ -138,30 +180,77 @@ class Database:
             if not self.get_user(uid):
                 self.add_user(uid, "Founder", "founder")
 
-    def get_user(self, uid): return self.cursor.execute("SELECT * FROM users WHERE telegram_id=?", (uid,)).fetchone()
-    def add_user(self, uid, name, role): 
-        self.cursor.execute("INSERT OR REPLACE INTO users (telegram_id, name, role) VALUES (?,?,?)", (uid, name, role))
-        self.conn.commit()
+    def get_user(self, uid):
+        with self.get_cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id=%s", (uid,))
+            return cur.fetchone()
+    
+    def add_user(self, uid, name, role):
+        with self.get_cursor() as cur:
+            # Postgres синтаксис для UPSERT (Insert or Update)
+            cur.execute("""
+                INSERT INTO users (telegram_id, name, role) VALUES (%s, %s, %s)
+                ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role
+            """, (uid, name, role))
+
     def delete_user(self, uid):
-        self.cursor.execute("DELETE FROM users WHERE telegram_id=?", (uid,))
-        self.conn.commit()
-    def get_all_users(self): return self.cursor.execute("SELECT * FROM users ORDER BY role").fetchall()
+        with self.get_cursor() as cur:
+            cur.execute("DELETE FROM users WHERE telegram_id=%s", (uid,))
+
+    def get_all_users(self):
+        with self.get_cursor() as cur:
+            cur.execute("SELECT * FROM users ORDER BY role")
+            return cur.fetchall()
     
     def delete_release_cascade(self, release_id):
-        self.cursor.execute("DELETE FROM tasks WHERE release_id=?", (release_id,))
-        self.cursor.execute("DELETE FROM releases WHERE id=?", (release_id,))
-        self.conn.commit()
+        with self.get_cursor() as cur:
+            cur.execute("DELETE FROM tasks WHERE release_id=%s", (release_id,))
+            cur.execute("DELETE FROM releases WHERE id=%s", (release_id,))
 
     def delete_task(self, task_id):
-        self.cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-        self.conn.commit()
+        with self.get_cursor() as cur:
+            cur.execute("DELETE FROM tasks WHERE id=%s", (task_id,))
 
     def get_user_link(self, uid):
         u = self.get_user(uid)
         if u: return f"<a href='tg://user?id={uid}'>{u['name']}</a>"
         return f"ID:{uid}"
+    
+    # --- Методы для задач и прочего (адаптированные под %s) ---
+    
+    def create_task(self, title, desc, assigned, created, rel_id, deadline, req_file=0, parent_id=None):
+        with self.get_cursor() as cur:
+            cur.execute("""
+                INSERT INTO tasks (title, description, assigned_to, created_by, release_id, deadline, requires_file, parent_task_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (title, desc, assigned, created, rel_id, deadline, req_file, parent_id))
 
-db = Database(DB_NAME)
+    def get_tasks_active_founder(self):
+        with self.get_cursor() as cur:
+            cur.execute("SELECT * FROM tasks WHERE status NOT IN ('done', 'rejected') ORDER BY deadline")
+            return cur.fetchall()
+
+    def get_tasks_active_user(self, uid):
+        with self.get_cursor() as cur:
+            cur.execute("SELECT * FROM tasks WHERE assigned_to=%s AND status NOT IN ('done', 'rejected') ORDER BY deadline", (uid,))
+            return cur.fetchall()
+
+    def get_task_by_id(self, tid):
+        with self.get_cursor() as cur:
+            cur.execute("SELECT * FROM tasks WHERE id=%s", (tid,))
+            return cur.fetchone()
+
+    def update_task_status(self, tid, status, file_url=None, comment=None):
+        with self.get_cursor() as cur:
+            if file_url or comment:
+                cur.execute("UPDATE tasks SET status=%s, file_url=%s, comment=%s WHERE id=%s", (status, file_url, comment, tid))
+            else:
+                cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, tid))
+
+    # --- Остальные методы (выборочно адаптированы ниже в коде) ---
+
+# Инициализация с URL из env
+db = Database(DATABASE_URL)
 
 # ==============================================================================
 # 3. FSM STATES
@@ -173,7 +262,7 @@ class FinishTask(StatesGroup): file=State(); comment=State()
 class SMMReportState(StatesGroup): text=State()
 
 # ==============================================================================
-# 4. КЛАВИАТУРЫ И УТИЛИТЫ
+# 4. UTILS
 # ==============================================================================
 def get_cancel_kb(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Отмена")]], resize_keyboard=True)
 
@@ -204,7 +293,7 @@ async def notify_user(uid, text, reply_markup=None):
     except: pass
 
 # ==============================================================================
-# 5. ХЕНДЛЕРЫ: ОБЩИЕ
+# 5. HANDLERS
 # ==============================================================================
 @dp.message.outer_middleware
 async def auth_middleware(handler, event: types.Message, data):
@@ -212,7 +301,7 @@ async def auth_middleware(handler, event: types.Message, data):
     if event.from_user:
         user = db.get_user(event.from_user.id)
         if not user:
-            await event.answer("⛔️ <b>Доступ запрещен.</b>\nВашего ID нет в системе.", parse_mode="HTML")
+            await event.answer("⛔️ <b>Доступ запрещен.</b>", parse_mode="HTML")
             return
     return await handler(event, data)
 
@@ -237,9 +326,7 @@ async def cmd_start(m: types.Message):
     role_name = ROLES_DISPLAY.get(user['role'], user['role'])
     await m.answer(f"👋 Привет, <b>{user['name']}</b>!\nРоль: <code>{role_name}</code>", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
 
-# ==============================================================================
-# 6. УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ
-# ==============================================================================
+# --- USERS ---
 @dp.message(F.text == "👥 Пользователи")
 async def list_users(m: types.Message):
     if db.get_user(m.from_user.id)['role'] != 'founder': return
@@ -279,15 +366,17 @@ async def add_user_finish(m: types.Message, state: FSMContext):
     role_code = ROLES_MAP.get(m.text)
     if not role_code: return await m.answer("⚠️ Выберите роль кнопкой.")
     data = await state.get_data()
-    db.add_user(data['uid'], data['name'], role_code)
+    db.add_user(int(data['uid']), data['name'], role_code)
     await m.answer(f"✅ <b>{data['name']}</b> добавлен!", reply_markup=get_main_kb('founder'), parse_mode="HTML")
-    await notify_user(data['uid'], f"🎉 <b>Добро пожаловать!</b>\nРоль: {m.text}\nНажмите /start")
+    await notify_user(int(data['uid']), f"🎉 <b>Добро пожаловать!</b>\nРоль: {m.text}\nНажмите /start")
     await state.clear()
 
 @dp.message(F.text == "🗑 Удалить юзера")
 async def delete_user_start(m: types.Message):
     if db.get_user(m.from_user.id)['role'] != 'founder': return
-    users = db.cursor.execute("SELECT * FROM users WHERE role != 'founder'").fetchall()
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE role != 'founder'")
+        users = cur.fetchall()
     if not users: return await m.answer("Удалять некого.")
     kb = InlineKeyboardBuilder()
     for u in users: kb.button(text=f"❌ {u['name']}", callback_data=f"rm_usr_{u['telegram_id']}")
@@ -300,9 +389,7 @@ async def delete_user_confirm(c: CallbackQuery):
     db.delete_user(uid)
     await c.message.edit_text("🗑 Пользователь удален.")
 
-# ==============================================================================
-# 7. РЕЛИЗЫ
-# ==============================================================================
+# --- RELEASES ---
 @dp.message(F.text == "💿 Создать релиз")
 async def create_release_start(m: types.Message, state: FSMContext):
     if db.get_user(m.from_user.id)['role'] not in ['founder', 'anr']: return
@@ -346,24 +433,27 @@ async def create_release_finish(m: types.Message, state: FSMContext):
     data = await state.get_data()
     manager_id = m.from_user.id
     
-    artist = db.cursor.execute("SELECT id FROM artists WHERE name=?", (data['artist'],)).fetchone()
-    if not artist:
-        db.cursor.execute("INSERT INTO artists (name, manager_id, first_release_date) VALUES (?,?,?)", (data['artist'], manager_id, clean_date))
-        artist_id = db.cursor.lastrowid
-    else: artist_id = artist['id']
-    
-    db.cursor.execute("INSERT INTO releases (title, artist_id, type, release_date, created_by) VALUES (?,?,?,?,?)",
-                      (data['title'], artist_id, data['type'], clean_date, manager_id))
-    rel_id = db.cursor.lastrowid
-    db.conn.commit()
+    with db.get_cursor() as cur:
+        cur.execute("SELECT id FROM artists WHERE name=%s", (data['artist'],))
+        artist = cur.fetchone()
+        if not artist:
+            cur.execute("INSERT INTO artists (name, manager_id, first_release_date) VALUES (%s, %s, %s) RETURNING id", 
+                        (data['artist'], manager_id, clean_date))
+            artist_id = cur.fetchone()[0]
+        else: artist_id = artist['id']
+        
+        cur.execute("INSERT INTO releases (title, artist_id, type, release_date, created_by) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (data['title'], artist_id, data['type'], clean_date, manager_id))
+        rel_id = cur.fetchone()[0]
     
     await generate_release_tasks(rel_id, data['title'], clean_date, manager_id, data['artist'], data['need_cover'])
-    
     await m.answer(f"🚀 <b>Релиз создан!</b>\n🎶 {data['artist']} — {data['title']}", reply_markup=get_main_kb(db.get_user(manager_id)['role']), parse_mode="HTML")
     await state.clear()
 
 async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name, need_cover):
-    designer = db.conn.execute("SELECT telegram_id FROM users WHERE role='designer'").fetchone()
+    with db.get_cursor() as cur:
+        cur.execute("SELECT telegram_id FROM users WHERE role='designer'")
+        designer = cur.fetchone()
     
     if designer:
         designer_id = designer['telegram_id']
@@ -373,9 +463,7 @@ async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name,
         designer_note = " (Fallback: нет дизайнера)"
 
     tasks = []
-    if need_cover: 
-        tasks.append(("🎨 Обложка", f"Сделать обложку: {artist_name} - {title}{designer_note}", designer_id, 14, 1))
-        
+    if need_cover: tasks.append(("🎨 Обложка", f"Сделать обложку: {artist_name} - {title}{designer_note}", designer_id, 14, 1))
     tasks.append(("📤 Дистрибуция", f"Загрузить трек: {artist_name} - {title}", manager_id, 10, 0))
     tasks.append(("📝 Питчинг", f"Форма питчинга: {artist_name} - {title}", manager_id, 7, 0))
     tasks.append(("📱 Сниппет", f"Видео-сниппет: {artist_name} - {title}{designer_note}", designer_id, 3, 1))
@@ -383,52 +471,42 @@ async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name,
     r_dt = datetime.datetime.strptime(r_date, "%Y-%m-%d")
     for t_name, t_desc, assignee, days, req in tasks:
         dl = (r_dt - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
-        create_task_in_db(f"{t_name} | {artist_name}", t_desc, assignee, manager_id, rel_id, dl, req)
+        db.create_task(f"{t_name} | {artist_name}", t_desc, assignee, manager_id, rel_id, dl, req)
 
-# СПИСОК РЕЛИЗОВ (ИНДИВИДУАЛЬНЫЙ / ОБЩИЙ)
 @dp.message(F.text.in_({"💿 Релизы", "💿 Все релизы", "💿 Мои релизы"}))
 async def list_releases(m: types.Message):
     uid = m.from_user.id
     user = db.get_user(uid)
-
     if user['role'] not in ['founder', 'anr']: return
 
-    if user['role'] == 'founder':
-        sql = """
-            SELECT r.*, u.name as creator_name
-            FROM releases r
-            LEFT JOIN users u ON r.created_by = u.telegram_id
-            ORDER BY r.release_date DESC LIMIT 20
-        """
-        rels = db.cursor.execute(sql).fetchall()
-        header = "💿 <b>Все релизы лейбла:</b>\n\n"
-    else:
-        sql = "SELECT * FROM releases WHERE created_by = ? ORDER BY release_date DESC LIMIT 20"
-        rels = db.cursor.execute(sql, (uid,)).fetchall()
-        header = "💿 <b>Ваши релизы:</b>\n\n"
+    with db.get_cursor() as cur:
+        if user['role'] == 'founder':
+            cur.execute("""
+                SELECT r.*, u.name as creator_name FROM releases r
+                LEFT JOIN users u ON r.created_by = u.telegram_id
+                ORDER BY r.release_date DESC LIMIT 20
+            """)
+            rels = cur.fetchall()
+            header = "💿 <b>Все релизы лейбла:</b>\n\n"
+        else:
+            cur.execute("SELECT * FROM releases WHERE created_by = %s ORDER BY release_date DESC LIMIT 20", (uid,))
+            rels = cur.fetchall()
+            header = "💿 <b>Ваши релизы:</b>\n\n"
     
     if not rels: return await m.answer("📭 Список пуст.")
     
     text = header
     for r in rels:
-        creator_info = ""
-        if user['role'] == 'founder':
-            c_name = r['creator_name'] if 'creator_name' in r.keys() and r['creator_name'] else "Удален"
-            creator_info = f"👤 От: {c_name}\n"
-
-        text += (
-            f"🎶 <b>{r['title']}</b> ({r['type']})\n"
-            f"📅 {r['release_date']}\n"
-            f"{creator_info}"
-            f"🆔 ID: <code>{r['id']}</code>\n"
-            f"➖➖➖➖➖➖\n"
-        )
+        c_info = f"👤 От: {r['creator_name']}\n" if user['role'] == 'founder' and 'creator_name' in r else ""
+        text += f"🎶 <b>{r['title']}</b> ({r['type']})\n📅 {r['release_date']}\n{c_info}🆔 ID: <code>{r['id']}</code>\n➖➖➖➖➖➖\n"
     await m.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "🗑 Удалить релиз")
 async def delete_rel_start(m: types.Message):
     if db.get_user(m.from_user.id)['role'] != 'founder': return
-    rels = db.cursor.execute("SELECT * FROM releases ORDER BY release_date DESC").fetchall()
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM releases ORDER BY release_date DESC")
+        rels = cur.fetchall()
     kb = InlineKeyboardBuilder()
     for r in rels: kb.button(text=f"❌ {r['title']}", callback_data=f"del_rel_{r['id']}")
     kb.adjust(1)
@@ -440,25 +518,7 @@ async def delete_rel_confirm(c: CallbackQuery):
     db.delete_release_cascade(rid)
     await c.message.edit_text("🗑 Релиз и задачи удалены.")
 
-# ==============================================================================
-# 8. УПРАВЛЕНИЕ ЗАДАЧАМИ
-# ==============================================================================
-def create_task_in_db(title, desc, assigned, created, rel_id, deadline, req_file=0, parent_id=None):
-    db.cursor.execute("""INSERT INTO tasks (title, description, assigned_to, created_by, release_id, deadline, requires_file, parent_task_id)
-        VALUES (?,?,?,?,?,?,?,?)""", (title, desc, assigned, created, rel_id, deadline, req_file, parent_id))
-    db.conn.commit()
-    
-    creator_name = db.get_user(created)['name']
-    msg = (
-        f"🔔 <b>НОВАЯ ЗАДАЧА</b>\n"
-        f"━━━━━━━━━━━━━━━━\n\n"
-        f"📌 <b>Задача:</b> {title}\n\n"
-        f"📄 <b>Описание:</b>\n{desc}\n\n"
-        f"🗓 <b>Дедлайн:</b> <code>{deadline}</code>\n"
-        f"👤 <b>От кого:</b> {creator_name}"
-    )
-    asyncio.create_task(notify_user(assigned, msg))
-
+# --- TASKS ---
 @dp.message(F.text == "➕ Создать задачу")
 async def manual_task_start(m: types.Message, state: FSMContext):
     await m.answer("📝 <b>Заголовок задачи:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
@@ -504,7 +564,9 @@ async def manual_task_req(m: types.Message, state: FSMContext):
 async def manual_task_fin(m: types.Message, state: FSMContext):
     req = 1 if m.text == "Да" else 0
     d = await state.get_data()
-    create_task_in_db(d['title'], d['desc'], d['assignee'], m.from_user.id, None, d['deadline'], req)
+    db.create_task(d['title'], d['desc'], d['assignee'], m.from_user.id, None, d['deadline'], req)
+    msg = f"🔔 <b>НОВАЯ ЗАДАЧА</b>\n📌 {d['title']}\n📄 {d['desc']}\n🗓 {d['deadline']}"
+    await notify_user(d['assignee'], msg)
     await m.answer("✅ Задача назначена!", reply_markup=get_main_kb(db.get_user(m.from_user.id)['role']))
     await state.clear()
 
@@ -514,10 +576,10 @@ async def view_tasks(m: types.Message):
     user = db.get_user(uid)
     
     if user['role'] == 'founder' and "Активные" in m.text:
-        tasks = db.cursor.execute("SELECT * FROM tasks WHERE status NOT IN ('done', 'rejected') ORDER BY deadline").fetchall()
+        tasks = db.get_tasks_active_founder()
         header = "📋 <b>Все активные задачи:</b>"
     else:
-        tasks = db.cursor.execute("SELECT * FROM tasks WHERE assigned_to=? AND status NOT IN ('done', 'rejected') ORDER BY deadline", (uid,)).fetchall()
+        tasks = db.get_tasks_active_user(uid)
         header = "📋 <b>Ваши задачи:</b>"
         
     if not tasks: return await m.answer("🎉 Задач нет!")
@@ -527,23 +589,14 @@ async def view_tasks(m: types.Message):
     for t in tasks:
         icon = "🔥" if t['status'] == 'overdue' else "⏳"
         creator = db.get_user_link(t['created_by'])
-        
-        txt = (
-            f"{icon} <b>{t['title']}</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"📄 {t['description']}\n\n"
-            f"🗓 Дедлайн: <code>{t['deadline']}</code>\n"
-            f"👤 От: {creator}"
-        )
+        txt = f"{icon} <b>{t['title']}</b>\n━━━━━━━━━━━━━━━━\n📄 {t['description']}\n\n🗓 <code>{t['deadline']}</code>\n👤 От: {creator}"
         
         kb = InlineKeyboardBuilder()
         if t['assigned_to'] == uid:
             kb.button(text="✅ Выполнить", callback_data=f"fin_{t['id']}")
             kb.button(text="⛔️ Отказаться", callback_data=f"rej_{t['id']}")
-        
         if user['role'] == 'founder':
             kb.button(text="🗑 Удалить", callback_data=f"admdel_{t['id']}")
-            
         kb.adjust(2)    
         await m.answer(txt, reply_markup=kb.as_markup(), parse_mode="HTML")
 
@@ -553,82 +606,72 @@ async def admin_del_task_ask(c: CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="Да, удалить", callback_data=f"confdel_{tid}")
     kb.button(text="Отмена", callback_data="ignore_cb")
-    await c.message.edit_text("⚠️ <b>Удалить эту задачу безвозвратно?</b>", reply_markup=kb.as_markup(), parse_mode="HTML")
+    await c.message.edit_text("⚠️ <b>Удалить задачу?</b>", reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("confdel_"))
 async def admin_del_task_confirm(c: CallbackQuery):
     tid = int(c.data.split("_")[1])
-    task = db.cursor.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    task = db.get_task_by_id(tid)
     if task:
         await notify_user(task['assigned_to'], f"🗑 <b>Задача аннулирована:</b>\n{task['title']}")
         db.delete_task(tid)
-        await c.message.edit_text("🗑 Задача удалена.")
-    else:
-        await c.answer("Задача уже удалена.")
+        await c.message.edit_text("🗑 Удалена.")
+    else: await c.answer("Уже удалена.")
 
 @dp.callback_query(F.data.startswith("rej_"))
 async def reject_ask(c: CallbackQuery):
     tid = c.data.split("_")[1]
     kb = InlineKeyboardBuilder()
     kb.button(text="Да, отказаться", callback_data=f"confrej_{tid}")
-    kb.button(text="Нет, вернусь", callback_data="ignore_cb")
-    await c.message.edit_text("⚠️ <b>Вы уверены, что хотите отказаться?</b>\nЭто отправит уведомление основателям.", reply_markup=kb.as_markup(), parse_mode="HTML")
+    kb.button(text="Вернуться", callback_data="ignore_cb")
+    await c.message.edit_text("⚠️ <b>Отказаться?</b>\nАдминистраторы получат уведомление.", reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("confrej_"))
 async def reject_confirm(c: CallbackQuery):
     tid = int(c.data.split("_")[1])
-    task = db.cursor.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    task = db.get_task_by_id(tid)
     if task:
-        db.cursor.execute("UPDATE tasks SET status='rejected' WHERE id=?", (tid,))
-        db.conn.commit()
-        
+        db.update_task_status(tid, 'rejected')
         rejector = db.get_user_link(c.from_user.id)
-        alert = (
-            f"⛔️ <b>ОТКАЗ ОТ ЗАДАЧИ</b>\n"
-            f"👤 Пользователь: {rejector}\n"
-            f"📌 Задача: {task['title']}\n"
-            f"⚠️ Статус изменен на 'rejected'."
-        )
+        alert = f"⛔️ <b>ОТКАЗ:</b> {task['title']}\n👤 {rejector}"
         for admin_id in ADMIN_IDS: await notify_user(admin_id, alert)
-        await c.message.edit_text("❌ Вы отказались от задачи.")
+        await c.message.edit_text("❌ Отказано.")
     else: await c.answer("Ошибка")
 
 @dp.callback_query(F.data == "ignore_cb")
-async def ignore_callback(c: CallbackQuery):
-    await c.message.delete()
+async def ignore_cb(c: CallbackQuery): await c.message.delete()
 
-# --- ИСТОРИЯ ---
+# --- HISTORY ---
 @dp.message(F.text.in_({"📜 История всех задач", "📜 История"}))
 async def history(m: types.Message):
     uid = m.from_user.id
     role = db.get_user(uid)['role']
-    limit = 20
     
-    if role == 'founder':
-        tasks = db.cursor.execute("SELECT * FROM tasks WHERE status='done' ORDER BY deadline DESC LIMIT ?", (limit,)).fetchall()
-        head = "📜 <b>Глобальная история:</b>"
-    else:
-        tasks = db.cursor.execute("SELECT * FROM tasks WHERE status='done' AND assigned_to=? ORDER BY deadline DESC LIMIT ?", (uid, limit)).fetchall()
-        head = "📜 <b>Ваша история:</b>"
+    with db.get_cursor() as cur:
+        if role == 'founder':
+            cur.execute("SELECT * FROM tasks WHERE status='done' ORDER BY deadline DESC LIMIT 20")
+            header = "📜 <b>Глобальная история:</b>"
+        else:
+            cur.execute("SELECT * FROM tasks WHERE status='done' AND assigned_to=%s ORDER BY deadline DESC LIMIT 20", (uid,))
+            header = "📜 <b>Ваша история:</b>"
+        tasks = cur.fetchall()
         
     if not tasks: return await m.answer("📭 Пусто.")
-    
-    txt = f"{head}\n\n"
+    txt = f"{header}\n\n"
     for t in tasks:
         user_link = db.get_user_link(t['assigned_to'])
         txt += f"✅ <b>{t['title']}</b>\n👤 {user_link}\n🗓 {t['deadline']}\n"
         if t['file_url']: 
-            if "tg:" in t['file_url']: txt += "📎 Файл (TG)\n"
-            else: txt += f"💾 <a href='{t['file_url']}'>Файл (Диск)</a>\n"
+            txt += "📎 Файл (TG)\n" if "tg:" in t['file_url'] else f"💾 <a href='{t['file_url']}'>Файл (Диск)</a>\n"
         txt += "━━━━━━━━━━━━━━━━\n"
     await m.answer(txt, parse_mode="HTML", disable_web_page_preview=True)
 
-# --- ЗАВЕРШЕНИЕ ЗАДАЧИ ---
+# --- FINISH ---
 @dp.callback_query(F.data.startswith("fin_"))
 async def fin_start(c: CallbackQuery, state: FSMContext):
     tid = int(c.data.split("_")[1])
-    task = db.cursor.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
-    if not task or task['status'] == 'done': return await c.answer("Неактуально.")
+    task = db.get_task_by_id(tid)
+    if not task or task['status'] == 'done': return await c.answer("Уже выполнено.")
     
     await state.update_data(tid=tid, creator=task['created_by'], title=task['title'])
     if task['requires_file']:
@@ -641,13 +684,11 @@ async def fin_start(c: CallbackQuery, state: FSMContext):
 @dp.message(FinishTask.file)
 async def fin_file(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
-    if not (m.document or m.photo): return await m.answer("📎 Жду файл или фото.")
+    if not (m.document or m.photo): return await m.answer("📎 Жду файл.")
     
     msg = await m.answer("⏳ Загрузка...")
-    if m.document:
-        fid, fname, ftype = m.document.file_id, m.document.file_name, "doc"
-    else:
-        fid, fname, ftype = m.photo[-1].file_id, f"photo_{m.photo[-1].file_id}.jpg", "photo"
+    if m.document: fid, fname, ftype = m.document.file_id, m.document.file_name, "doc"
+    else: fid, fname, ftype = m.photo[-1].file_id, f"photo_{m.photo[-1].file_id}.jpg", "photo"
 
     pub_url = None
     try:
@@ -671,23 +712,20 @@ async def fin_file(m: types.Message, state: FSMContext):
 async def fin_commit(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
     d = await state.get_data()
-    f_val = d.get('f_val')
-    
-    db.cursor.execute("UPDATE tasks SET status='done', file_url=?, comment=? WHERE id=?", (f_val, m.text, d['tid']))
-    db.conn.commit()
+    db.update_task_status(d['tid'], 'done', d.get('f_val'), m.text)
     
     perf = db.get_user_link(m.from_user.id)
-    txt = f"✅ <b>Задача выполнена!</b>\n📌 {d['title']}\n👤 {perf}\n💬 {m.text}"
+    txt = f"✅ <b>Выполнено!</b>\n📌 {d['title']}\n👤 {perf}\n💬 {m.text}"
     
     try:
-        if f_val and "tg:" in f_val:
+        if d.get('f_val') and "tg:" in d['f_val']:
             txt += "\n📎 Файл ниже"
             await notify_user(d['creator'], txt)
-            _, type_, fid = f_val.split(":", 2)
+            _, type_, fid = d['f_val'].split(":", 2)
             if type_ == "photo": await bot.send_photo(d['creator'], fid)
             else: await bot.send_document(d['creator'], fid)
-        elif f_val:
-            txt += f"\n💾 <a href='{f_val}'>Файл (Диск)</a>"
+        elif d.get('f_val'):
+            txt += f"\n💾 <a href='{d['f_val']}'>Файл (Диск)</a>"
             await notify_user(d['creator'], txt)
         else:
             await notify_user(d['creator'], txt)
@@ -696,64 +734,56 @@ async def fin_commit(m: types.Message, state: FSMContext):
     await m.answer("👍 Готово.", reply_markup=get_main_kb(db.get_user(m.from_user.id)['role']))
     await state.clear()
 
-# ==============================================================================
-# 9. SMM И ПЛАНИРОВЩИК
-# ==============================================================================
+# --- SMM & CRON ---
 @dp.message(F.text == "📝 Написать отчет")
 async def smm_start(m: types.Message, state: FSMContext):
-    await m.answer("✍️ Текст отчета:", reply_markup=get_cancel_kb())
+    await m.answer("✍️ Текст:", reply_markup=get_cancel_kb())
     await state.set_state(SMMReportState.text)
 
 @dp.message(SMMReportState.text)
 async def smm_save(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
-    db.cursor.execute("INSERT INTO reports (user_id, report_date, text) VALUES (?,?,?)", (m.from_user.id, datetime.date.today(), m.text))
-    db.conn.commit()
+    with db.get_cursor() as cur:
+        cur.execute("INSERT INTO reports (user_id, report_date, text) VALUES (%s, %s, %s)", (m.from_user.id, datetime.date.today(), m.text))
     await m.answer("✅ Принято.", reply_markup=get_main_kb('smm'))
     await state.clear()
 
 @dp.message(F.text == "📅 Мои отчеты")
 async def smm_list(m: types.Message):
-    reps = db.cursor.execute("SELECT * FROM reports WHERE user_id=? ORDER BY id DESC LIMIT 20", (m.from_user.id,)).fetchall()
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM reports WHERE user_id=%s ORDER BY id DESC LIMIT 20", (m.from_user.id,))
+        reps = cur.fetchall()
     await m.answer("\n".join([f"📅 <b>{r['report_date']}</b>: {r['text']}" for r in reps]) if reps else "Пусто.", parse_mode="HTML")
 
-# АВТОМАТИКА
 async def job_check_overdue():
     today = datetime.date.today().strftime("%Y-%m-%d")
-    tasks = db.cursor.execute("SELECT * FROM tasks WHERE deadline < ? AND status != 'done'", (today,)).fetchall()
-    for t in tasks:
-        if t['status'] != 'overdue':
-            db.cursor.execute("UPDATE tasks SET status='overdue' WHERE id=?", (t['id'],))
-            db.conn.commit()
-        await notify_user(t['assigned_to'], f"⚠️ <b>ПРОСРОЧЕНО!</b>\n📌 {t['title']}")
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM tasks WHERE deadline < %s AND status != 'done'", (today,))
+        tasks = cur.fetchall()
+        for t in tasks:
+            if t['status'] != 'overdue':
+                cur.execute("UPDATE tasks SET status='overdue' WHERE id=%s", (t['id'],))
+            await notify_user(t['assigned_to'], f"⚠️ <b>ПРОСРОЧЕНО!</b>\n📌 {t['title']}")
 
 async def job_deadline_alerts():
     tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    tasks = db.cursor.execute("SELECT * FROM tasks WHERE deadline = ? AND status != 'done'", (tomorrow,)).fetchall()
-    for t in tasks: await notify_user(t['assigned_to'], f"⏰ <b>Дедлайн < 24ч!</b>\n📌 {t['title']}")
-
-async def job_smm_daily():
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    for s in db.cursor.execute("SELECT telegram_id FROM users WHERE role='smm'").fetchall():
-        create_task_in_db("Daily SMM", "Сториз+Пост", s['telegram_id'], ADMIN_IDS[0], None, today)
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM tasks WHERE deadline = %s AND status != 'done'", (tomorrow,))
+        for t in cur.fetchall(): await notify_user(t['assigned_to'], f"⏰ <b>Дедлайн < 24ч!</b>\n📌 {t['title']}")
 
 async def job_onboarding():
-    for a in db.cursor.execute("SELECT * FROM artists WHERE flag_contract=0").fetchall():
-        kb = InlineKeyboardBuilder().button(text="✅ Да", callback_data=f"onb_cont_{a['id']}").button(text="Позже", callback_data="ign")
-        await notify_user(a['manager_id'], f"📝 Контракт с <b>{a['name']}</b> подписан?", kb.as_markup())
-    
-    if datetime.datetime.now().weekday() == 0:
-        for a in db.cursor.execute("SELECT * FROM artists WHERE flag_mm_profile=0").fetchall():
-            kb = InlineKeyboardBuilder().button(text="✅ Да", callback_data=f"onb_mm_{a['id']}").button(text="Позже", callback_data="ign")
-            await notify_user(a['manager_id'], f"🎵 MM профиль для <b>{a['name']}</b>?", kb.as_markup())
+    with db.get_cursor() as cur:
+        cur.execute("SELECT * FROM artists WHERE flag_contract=0")
+        for a in cur.fetchall():
+            kb = InlineKeyboardBuilder().button(text="✅ Да", callback_data=f"onb_cont_{a['id']}").button(text="Позже", callback_data="ign")
+            await notify_user(a['manager_id'], f"📝 Контракт с <b>{a['name']}</b> подписан?", kb.as_markup())
 
 @dp.callback_query(F.data.startswith("onb_"))
 async def onb_act(c: CallbackQuery):
-    col = {'cont': 'flag_contract', 'mm': 'flag_mm_profile'}.get(c.data.split("_")[1])
+    col = {'cont': 'flag_contract'}.get(c.data.split("_")[1])
     if col:
-        db.cursor.execute(f"UPDATE artists SET {col}=1 WHERE id=?", (int(c.data.split("_")[2]),))
-        db.conn.commit()
-        await c.message.edit_text("✅ Статус обновлен!")
+        with db.get_cursor() as cur: cur.execute(f"UPDATE artists SET {col}=1 WHERE id=%s", (int(c.data.split("_")[2]),))
+        await c.message.edit_text("✅ Обновлено!")
 
 @dp.callback_query(F.data == "ign")
 async def ign(c: CallbackQuery): await c.message.delete()
@@ -761,11 +791,10 @@ async def ign(c: CallbackQuery): await c.message.delete()
 async def main():
     scheduler.add_job(job_check_overdue, CronTrigger(minute=0))
     scheduler.add_job(job_deadline_alerts, CronTrigger(hour='0,6,12,18'))
-    scheduler.add_job(job_smm_daily, CronTrigger(hour=9))
     scheduler.add_job(job_onboarding, CronTrigger(hour=15))
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True)
-    print("BOT STARTED")
+    print("BOT STARTED (POSTGRESQL VERSION)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
