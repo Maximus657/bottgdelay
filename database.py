@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Авто-фикс ссылки для асинхронного движка
 raw_url = os.getenv("DATABASE_URL", "")
 if raw_url and raw_url.startswith("postgresql://"):
     DATABASE_URL = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
@@ -54,10 +53,10 @@ class User(Base):
 class Artist(Base):
     __tablename__ = "artists"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String)
-    ar_manager_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    name: Mapped[str] = mapped_column(String, unique=True)
+    created_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
-    # Onboarding flags
+    # ВСЕ ФЛАГИ ОНБОРДИНГА ИЗ ТЗ
     contract_signed: Mapped[bool] = mapped_column(Boolean, default=False)
     musixmatch_profile: Mapped[bool] = mapped_column(Boolean, default=False)
     musixmatch_verified: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -68,10 +67,11 @@ class Release(Base):
     __tablename__ = "releases"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
+    artist_name: Mapped[str] = mapped_column(String)
     feat_artists: Mapped[str] = mapped_column(String, nullable=True)
     release_type: Mapped[str] = mapped_column(String)
-    artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"))
     release_date: Mapped[datetime] = mapped_column(DateTime)
+    cover_provided: Mapped[bool] = mapped_column(Boolean, default=False)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
     tasks: Mapped[List["Task"]] = relationship("Task", back_populates="release", cascade="all, delete-orphan")
@@ -80,25 +80,16 @@ class Task(Base):
     __tablename__ = "tasks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
-    description: Mapped[str] = mapped_column(Text, nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=True) # Сюда будем писать коммент при завершении
     status: Mapped[str] = mapped_column(String, default=TaskStatus.PENDING)
     deadline: Mapped[datetime] = mapped_column(DateTime)
-    
     assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    
-    # Привязка к релизу с каскадным удалением
     release_id: Mapped[Optional[int]] = mapped_column(ForeignKey("releases.id", ondelete="CASCADE"), nullable=True)
     release: Mapped[Optional["Release"]] = relationship("Release", back_populates="tasks")
-    
-    # Иерархия задач (родитель-ребенок)
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
-    
     needs_file: Mapped[bool] = mapped_column(Boolean, default=False)
     file_url: Mapped[str] = mapped_column(String, nullable=True)
-    
-    # Вот та самая колонка, из-за которой была ошибка.
-    # server_default гарантирует, что на уровне БД она не будет NULL
     is_regular: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text('false'))
 
 class Report(Base):
@@ -108,14 +99,7 @@ class Report(Base):
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
-# --- АВТО-ЧИСТКА (Fixer) ---
 async def init_db_and_clean():
-    """
-    Эта функция полностью пересоздаст таблицы при старте.
-    Это решит все проблемы с IntegrityError и отсутствующими колонками.
-    """
     async with engine.begin() as conn:
-        # Удаляем всё старое
         await conn.run_sync(Base.metadata.drop_all)
-        # Создаем всё новое и правильное
         await conn.run_sync(Base.metadata.create_all)

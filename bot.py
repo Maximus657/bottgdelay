@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types, Router
@@ -42,39 +42,30 @@ logger = logging.getLogger(__name__)
 # --- YANDEX DISK SERVICE ---
 class YandexDiskService:
     BASE_URL = "https://cloud-api.yandex.net/v1/disk/resources"
-
     @staticmethod
     async def upload_file(file_url: str, filename: str, bot: Bot):
-        if not YandexDisk_TOKEN or len(YandexDisk_TOKEN) < 5:
-            return f"mock_storage/{filename}" # Заглушка если нет токена
-            
+        if not YandexDisk_TOKEN or len(YandexDisk_TOKEN) < 5: return f"mock_storage/{filename}"
         headers = {"Authorization": f"OAuth {YandexDisk_TOKEN}"}
         async with aiohttp.ClientSession() as session:
-            path = f"MusicAlligatorBot/{filename}"
-            params = {"path": path, "overwrite": "true"}
-            
-            # 1. Получаем ссылку
+            params = {"path": f"MusicAlligatorBot/{filename}", "overwrite": "true"}
             async with session.get(f"{YandexDiskService.BASE_URL}/upload", headers=headers, params=params) as resp:
-                if resp.status != 200: 
-                    logger.error(f"YD Error: {await resp.text()}")
-                    return None
+                if resp.status != 200: return None
                 data = await resp.json()
-                upload_href = data['href']
-            
-            # 2. Качаем и заливаем
-            file_info = await bot.get_file(file_url)
-            file_stream = await bot.download_file(file_info.file_path)
-            async with session.put(upload_href, data=file_stream) as resp:
+                href = data['href']
+            f_info = await bot.get_file(file_url)
+            stream = await bot.download_file(f_info.file_path)
+            async with session.put(href, data=stream) as resp:
                 if resp.status != 201: return None
-            return path
+            return f"MusicAlligatorBot/{filename}"
 
 # --- STATES ---
 class ReleaseState(StatesGroup):
-    waiting_for_artist = State()
+    waiting_for_artist_name = State()
     waiting_for_feat = State()
     waiting_for_title = State()
     waiting_for_type = State()
     waiting_for_date = State()
+    waiting_for_cover_status = State()
 
 class CustomTaskState(StatesGroup):
     waiting_for_title = State()
@@ -84,9 +75,7 @@ class CustomTaskState(StatesGroup):
 
 class TaskCompletionState(StatesGroup):
     waiting_for_file = State()
-
-class ArtistState(StatesGroup):
-    waiting_for_name = State()
+    waiting_for_comment = State()
 
 class AddUserState(StatesGroup):
     waiting_for_id = State()
@@ -101,439 +90,464 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# --- TEMPLATES (По ТЗ) ---
-RELEASE_TEMPLATES = {
-    "all": [
-        # Задача для AR (Родительская для обложки)
-        {"title": "Контроль обложки", "role": UserRole.AR_MANAGER, "delta": -12, "file": False, "is_parent_for_cover": True},
-        {"title": "Загрузить на площадки", "role": UserRole.AR_MANAGER, "delta": -14, "file": False},
-        {"title": "Запросить текст", "role": UserRole.AR_MANAGER, "delta": -15, "file": False},
-        {"title": "Проверить копирайты", "role": UserRole.FOUNDER, "delta": -5, "file": False}
-    ],
-    "pitching": {"title": "Питчинг в Spotify", "role": UserRole.AR_MANAGER, "delta": -14, "file": False}
-}
+# --- TEMPLATES ---
+RELEASE_TEMPLATES = [
+    {"title": "🎨 Создать обложку", "role": UserRole.DESIGNER, "delta": -14, "file": True, "condition": "no_cover"},
+    {"title": "🎥 Создать Canvas", "role": UserRole.DESIGNER, "delta": -10, "file": True, "condition": "always"},
+    {"title": "📤 Загрузить обложку (Диск)", "role": UserRole.AR_MANAGER, "delta": -13, "file": True, "condition": "has_cover"},
+    {"title": "📤 Загрузить на площадки", "role": UserRole.AR_MANAGER, "delta": -14, "file": False, "condition": "always"},
+    {"title": "📝 Запросить текст", "role": UserRole.AR_MANAGER, "delta": -15, "file": False, "condition": "always"},
+    {"title": "⚖️ Проверить копирайты", "role": UserRole.FOUNDER, "delta": -5, "file": False, "condition": "always"}
+]
+PITCHING_TEMPLATE = {"title": "🚀 Питчинг в Spotify", "role": UserRole.AR_MANAGER, "delta": -14, "file": False}
 
-# --- MENUS ---
+SMM_DAILY_TEMPLATES = ["📲 Выложить сторис", "💬 Проверить директ", "📈 Анализ статистики"]
+
+# --- MENU ---
 def get_main_menu(role: str):
     builder = ReplyKeyboardBuilder()
     if role == UserRole.FOUNDER:
         builder.row(KeyboardButton(text="👥 Команда"), KeyboardButton(text="📊 Статистика"))
         builder.row(KeyboardButton(text="📀 Релизы"), KeyboardButton(text="➕ Создать задачу"))
-        builder.row(KeyboardButton(text="➕ Новый Релиз"), KeyboardButton(text="➕ Добавить Артиста")) # CEO тоже может
+        builder.row(KeyboardButton(text="➕ Новый Релиз"))
     elif role == UserRole.AR_MANAGER:
-        builder.row(KeyboardButton(text="🎤 Артисты"), KeyboardButton(text="📀 Релизы"))
-        builder.row(KeyboardButton(text="➕ Новый Релиз"), KeyboardButton(text="➕ Добавить Артиста"))
+        builder.row(KeyboardButton(text="📀 Релизы"), KeyboardButton(text="➕ Новый Релиз"))
         builder.row(KeyboardButton(text="➕ Создать задачу"))
     elif role == UserRole.DESIGNER:
-        builder.row(KeyboardButton(text="🎨 Задачи по обложкам"))
+        builder.row(KeyboardButton(text="🎨 Задачи по дизайну"))
     elif role == UserRole.SMM:
         builder.row(KeyboardButton(text="📝 Отчет за сегодня"), KeyboardButton(text="📅 Архив отчетов"))
-    
     builder.row(KeyboardButton(text="📋 Мои Задачи"))
     return builder.as_markup(resize_keyboard=True)
 
-# --- AUTH & START ---
+# --- AUTH & TEAM ---
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
+async def cmd_start(msg: types.Message):
+    user_id = msg.from_user.id
     async with async_session() as session:
-        # Авто-добавление Админов
         if user_id in ADMIN_IDS:
-            u = await session.get(User, user_id)
-            if not u:
-                session.add(User(id=user_id, full_name=message.from_user.full_name, role=UserRole.FOUNDER))
+            if not await session.get(User, user_id):
+                session.add(User(id=user_id, full_name=msg.from_user.full_name, role=UserRole.FOUNDER))
                 await session.commit()
-        
-        user = await session.get(User, user_id)
-        if not user or not user.is_active:
-            await message.answer(f"⛔ Нет доступа. ID: <code>{user_id}</code>. Передайте ID админу.", parse_mode="HTML")
+        u = await session.get(User, user_id)
+        if not u or not u.is_active:
+            await msg.answer(f"⛔ Нет доступа. Ваш ID: {user_id}")
             return
-        
-        # Обновляем имя
-        user.full_name = message.from_user.full_name
-        user.username = message.from_user.username
+        u.full_name = msg.from_user.full_name
+        u.username = msg.from_user.username
         await session.commit()
-        
-        await message.answer(f"👋 Привет, {user.role}!", reply_markup=get_main_menu(user.role))
+        await msg.answer(f"👋 Привет, {u.role}!", reply_markup=get_main_menu(u.role))
 
-# --- TEAM MANAGEMENT ---
 @router.message(F.text.in_({"👥 Команда", "👥 Управление командой"}))
-async def team_list(message: types.Message):
+async def team_view(msg: types.Message):
     async with async_session() as session:
-        u = await session.get(User, message.from_user.id)
-        if u.role != UserRole.FOUNDER: return
-        
+        if (await session.get(User, msg.from_user.id)).role != UserRole.FOUNDER: return
         users = (await session.execute(select(User).order_by(User.role))).scalars().all()
-        text = "🏢 <b>Команда:</b>\n"
+        txt = "🏢 <b>Команда:</b>\n"
         kb = InlineKeyboardBuilder()
-        
-        for x in users:
-            text += f"- {x.full_name} ({x.role})\n"
-            kb.button(text=f"✏️ {x.full_name}", callback_data=f"editrole_{x.id}")
-            
+        for u in users:
+            txt += f"- {u.full_name} ({u.role})\n"
+            kb.button(text=f"✏️ {u.full_name}", callback_data=f"editrole_{u.id}")
         kb.button(text="➕ Добавить сотрудника", callback_data="add_new_user")
         kb.adjust(1)
-        await message.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
+        await msg.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data == "add_new_user")
-async def add_user_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("🆔 Введите Telegram ID (цифры):")
+async def add_user_s1(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("🆔 Введите ID:")
     await state.set_state(AddUserState.waiting_for_id)
-    await callback.answer()
+    await cb.answer()
 
 @router.message(AddUserState.waiting_for_id)
-async def add_user_id(message: types.Message, state: FSMContext):
+async def add_user_s2(msg: types.Message, state: FSMContext):
     try:
-        uid = int(message.text)
-        await state.update_data(uid=uid)
+        await state.update_data(uid=int(msg.text))
         kb = InlineKeyboardBuilder()
         for r in UserRole: kb.button(text=r.value, callback_data=f"newrole_{r.value}")
         kb.adjust(1)
-        await message.answer("👤 Выберите роль:", reply_markup=kb.as_markup())
+        await msg.answer("Роль:", reply_markup=kb.as_markup())
         await state.set_state(AddUserState.waiting_for_role)
-    except:
-        await message.answer("❌ Только цифры.")
+    except: await msg.answer("Цифры!")
 
-@router.callback_query(F.data.startswith("newrole_"), AddUserState.waiting_for_role)
-async def add_user_fin(callback: CallbackQuery, state: FSMContext):
-    role = callback.data.split("_")[1]
+@router.callback_query(F.data.startswith("newrole_"))
+async def add_user_s3(cb: CallbackQuery, state: FSMContext):
+    role = cb.data.split("_")[1]
     data = await state.get_data()
     async with async_session() as session:
-        # Upsert
         u = await session.get(User, data['uid'])
-        if not u:
-            session.add(User(id=data['uid'], role=role, full_name="Новый"))
-        else:
-            u.role = role
-            u.is_active = True
+        if not u: session.add(User(id=data['uid'], role=role, full_name="New User"))
+        else: u.role = role; u.is_active = True
         await session.commit()
-    await callback.message.edit_text(f"✅ Пользователь добавлен/обновлен. Роль: {role}")
+    await cb.message.edit_text(f"✅ Добавлен: {role}")
     await state.clear()
+
+@router.callback_query(F.data.startswith("editrole_"))
+async def edit_role_s1(cb: CallbackQuery, state: FSMContext):
+    uid = int(cb.data.split("_")[1])
+    await state.update_data(uid=uid)
+    kb = InlineKeyboardBuilder()
+    for r in UserRole: kb.button(text=r.value, callback_data=f"newrole_{r.value}")
+    kb.adjust(1)
+    await cb.message.edit_text("Новая роль:", reply_markup=kb.as_markup())
 
 # --- CUSTOM TASKS ---
 @router.message(F.text == "➕ Создать задачу")
-async def task_create(message: types.Message, state: FSMContext):
+async def ct_start(msg: types.Message, state: FSMContext):
     async with async_session() as session:
-        u = await session.get(User, message.from_user.id)
-        if u.role not in [UserRole.FOUNDER, UserRole.AR_MANAGER]: return
-    
-    await message.answer("✍️ Название:", reply_markup=ReplyKeyboardRemove())
+        if (await session.get(User, msg.from_user.id)).role not in [UserRole.FOUNDER, UserRole.AR_MANAGER]: return
+    await msg.answer("✍️ Название:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(CustomTaskState.waiting_for_title)
 
 @router.message(CustomTaskState.waiting_for_title)
-async def task_title(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await message.answer("✍️ Описание (или '-'):")
+async def ct_title(msg: types.Message, state: FSMContext):
+    await state.update_data(title=msg.text)
+    await msg.answer("✍️ Описание (или '-'):")
     await state.set_state(CustomTaskState.waiting_for_desc)
 
 @router.message(CustomTaskState.waiting_for_desc)
-async def task_desc(message: types.Message, state: FSMContext):
-    d = message.text if message.text != "-" else None
-    await state.update_data(desc=d)
-    
+async def ct_desc(msg: types.Message, state: FSMContext):
+    await state.update_data(desc=msg.text if msg.text != "-" else None)
     async with async_session() as session:
         users = (await session.execute(select(User).where(User.is_active==True))).scalars().all()
         kb = InlineKeyboardBuilder()
         for u in users: kb.button(text=f"{u.full_name} ({u.role})", callback_data=f"asgn_{u.id}")
         kb.adjust(1)
-        await message.answer("👤 Исполнитель:", reply_markup=kb.as_markup())
+        await msg.answer("👤 Исполнитель:", reply_markup=kb.as_markup())
         await state.set_state(CustomTaskState.waiting_for_assignee)
 
 @router.callback_query(F.data.startswith("asgn_"), CustomTaskState.waiting_for_assignee)
-async def task_assign(callback: CallbackQuery, state: FSMContext):
-    aid = int(callback.data.split("_")[1])
-    await state.update_data(aid=aid)
-    await callback.message.edit_text("📅 Дедлайн (ДД.ММ.ГГГГ):")
+async def ct_asgn(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(aid=int(cb.data.split("_")[1]))
+    await cb.message.edit_text("📅 Дедлайн (ДД.ММ.ГГГГ):")
     await state.set_state(CustomTaskState.waiting_for_deadline)
 
 @router.message(CustomTaskState.waiting_for_deadline)
-async def task_fin(message: types.Message, state: FSMContext):
-    try:
-        dt = datetime.strptime(message.text, "%d.%m.%Y").replace(hour=23, minute=59)
-    except:
-        await message.answer("❌ Формат ДД.ММ.ГГГГ")
+async def ct_fin(msg: types.Message, state: FSMContext):
+    try: dt = datetime.strptime(msg.text, "%d.%m.%Y").replace(hour=23, minute=59)
+    except: 
+        await msg.answer("ДД.ММ.ГГГГ")
         return
-    
-    data = await state.get_data()
+    d = await state.get_data()
     async with async_session() as session:
-        # FIX: Явно передаем is_regular=False чтобы избежать null ошибки
-        t = Task(
-            title=data['title'], description=data['desc'], status=TaskStatus.PENDING,
-            deadline=dt, assignee_id=data['aid'], creator_id=message.from_user.id,
-            is_regular=False 
-        )
-        session.add(t)
+        session.add(Task(title=d['title'], description=d['desc'], status=TaskStatus.PENDING, deadline=dt, assignee_id=d['aid'], creator_id=msg.from_user.id, is_regular=False))
         await session.commit()
-        try: await bot.send_message(data['aid'], f"🆕 Задача: {data['title']}\n📅 {message.text}")
-        except: pass
-        
-        u = await session.get(User, message.from_user.id)
-        await message.answer("✅ Создано!", reply_markup=get_main_menu(u.role))
+        u = await session.get(User, msg.from_user.id)
+        await msg.answer("✅ Создано", reply_markup=get_main_menu(u.role))
     await state.clear()
 
-# --- RELEASES (WITH FOUNDER ACCESS & FEAT) ---
+# --- RELEASES ---
 @router.message(F.text == "➕ Новый Релиз")
-async def rel_start(message: types.Message, state: FSMContext):
+async def rel_start(msg: types.Message, state: FSMContext):
     async with async_session() as session:
-        # Проверка прав: Основатель ИЛИ AR
-        u = await session.get(User, message.from_user.id)
-        if u.role not in [UserRole.FOUNDER, UserRole.AR_MANAGER]:
-            await message.answer("⛔ Нет прав.")
-            return
-            
-        artists = (await session.execute(select(Artist))).scalars().all()
-        if not artists:
-            await message.answer("⚠️ Нет артистов.")
-            return
-            
-        kb = ReplyKeyboardBuilder()
-        for a in artists: kb.button(text=a.name)
-        kb.adjust(2)
-        await message.answer("👤 Артист:", reply_markup=kb.as_markup(resize_keyboard=True))
-        await state.set_state(ReleaseState.waiting_for_artist)
+        if (await session.get(User, msg.from_user.id)).role not in [UserRole.FOUNDER, UserRole.AR_MANAGER]: return
+    await msg.answer("🎤 Имя артиста:", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(ReleaseState.waiting_for_artist_name)
 
-@router.message(ReleaseState.waiting_for_artist)
-async def rel_artist(message: types.Message, state: FSMContext):
-    async with async_session() as session:
-        a = (await session.execute(select(Artist).where(Artist.name==message.text))).scalar_one_or_none()
-        if not a: return
-        await state.update_data(aid=a.id)
-    await message.answer("👯 Feat (Со-артисты) или '-':", reply_markup=ReplyKeyboardRemove())
+@router.message(ReleaseState.waiting_for_artist_name)
+async def rel_name(msg: types.Message, state: FSMContext):
+    await state.update_data(aname=msg.text)
+    await msg.answer("👯 Feat (или '-'):")
     await state.set_state(ReleaseState.waiting_for_feat)
 
 @router.message(ReleaseState.waiting_for_feat)
-async def rel_feat(message: types.Message, state: FSMContext):
-    ft = message.text if message.text != "-" else None
-    await state.update_data(feat=ft)
-    await message.answer("💿 Название:")
+async def rel_feat(msg: types.Message, state: FSMContext):
+    await state.update_data(feat=msg.text if msg.text != "-" else None)
+    await msg.answer("💿 Название:")
     await state.set_state(ReleaseState.waiting_for_title)
 
 @router.message(ReleaseState.waiting_for_title)
-async def rel_title(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
+async def rel_title(msg: types.Message, state: FSMContext):
+    await state.update_data(title=msg.text)
     kb = ReplyKeyboardBuilder()
     for t in ReleaseType: kb.button(text=t.value)
     kb.adjust(1)
-    await message.answer("💿 Тип:", reply_markup=kb.as_markup(resize_keyboard=True))
+    await msg.answer("💿 Тип:", reply_markup=kb.as_markup(resize_keyboard=True))
     await state.set_state(ReleaseState.waiting_for_type)
 
 @router.message(ReleaseState.waiting_for_type)
-async def rel_type(message: types.Message, state: FSMContext):
-    await state.update_data(rtype=message.text)
-    await message.answer("📅 Дата (ДД.ММ.ГГГГ):", reply_markup=ReplyKeyboardRemove())
+async def rel_type(msg: types.Message, state: FSMContext):
+    await state.update_data(rtype=msg.text)
+    await msg.answer("📅 Дата (ДД.ММ.ГГГГ):", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ReleaseState.waiting_for_date)
 
 @router.message(ReleaseState.waiting_for_date)
-async def rel_date(message: types.Message, state: FSMContext):
-    try:
-        d = datetime.strptime(message.text, "%d.%m.%Y")
-    except:
-        await message.answer("❌ Формат ДД.ММ.ГГГГ")
+async def rel_date(msg: types.Message, state: FSMContext):
+    try: d = datetime.strptime(msg.text, "%d.%m.%Y")
+    except: 
+        await msg.answer("ДД.ММ.ГГГГ")
         return
-    
+    await state.update_data(date=d)
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="✅ Есть")
+    kb.button(text="❌ Нет")
+    kb.adjust(2)
+    await msg.answer("🎨 Обложка готова?", reply_markup=kb.as_markup(resize_keyboard=True))
+    await state.set_state(ReleaseState.waiting_for_cover_status)
+
+@router.message(ReleaseState.waiting_for_cover_status)
+async def rel_fin(msg: types.Message, state: FSMContext):
+    has_cov = msg.text == "✅ Есть"
     data = await state.get_data()
     async with async_session() as session:
-        rel = Release(
-            title=data['title'], feat_artists=data['feat'], release_type=data['rtype'],
-            artist_id=data['aid'], release_date=d, created_by=message.from_user.id
-        )
+        # Артист (Онбординг старт)
+        art = (await session.execute(select(Artist).where(Artist.name==data['aname']))).scalar_one_or_none()
+        if not art:
+            session.add(Artist(name=data['aname'], created_by_id=msg.from_user.id))
+            await session.flush()
+        
+        # Релиз
+        rel = Release(title=data['title'], artist_name=data['aname'], feat_artists=data['feat'], release_type=data['rtype'], release_date=data['date'], created_by=msg.from_user.id, cover_provided=has_cov)
         session.add(rel)
         await session.flush()
         
-        # Иерархия задач и шаблоны
-        designers = (await session.execute(select(User).where(User.role==UserRole.DESIGNER))).scalars().all()
-        designer_id = designers[0].id if designers else message.from_user.id
-        
-        title_full = f"{data['title']}"
-        if data['feat']: title_full += f" (feat. {data['feat']})"
+        # Задачи
+        des = (await session.execute(select(User).where(User.role==UserRole.DESIGNER))).scalars().all()
+        des_id = des[0].id if des else msg.from_user.id
+        full = f"{data['aname']} - {data['title']}"
 
-        for t in RELEASE_TEMPLATES["all"]:
-            dl = d + timedelta(days=t['delta'])
+        for tmpl in RELEASE_TEMPLATES:
+            if tmpl.get("condition") == "no_cover" and has_cov: continue
+            if tmpl.get("condition") == "has_cover" and not has_cov: continue
+            
+            aid = des_id if tmpl['role'] == UserRole.DESIGNER else msg.from_user.id
             # Создаем задачу
-            task = Task(
-                title=f"{t['title']} - {title_full}", 
-                status=TaskStatus.PENDING, deadline=dl,
-                assignee_id=message.from_user.id if t['role'] != UserRole.DESIGNER else designer_id,
-                creator_id=message.from_user.id, release_id=rel.id, needs_file=t['file'],
-                is_regular=False
-            )
-            session.add(task)
+            t = Task(title=f"{tmpl['title']} | {full}", status=TaskStatus.PENDING, deadline=data['date']+timedelta(days=tmpl['delta']), assignee_id=aid, creator_id=msg.from_user.id, release_id=rel.id, needs_file=tmpl['file'], is_regular=False)
+            session.add(t)
             await session.flush()
+            
+            # Иерархия (обложка A&R -> обложка Designer)
+            if tmpl['role'] == UserRole.AR_MANAGER and "обложка" in tmpl['title'].lower() and not has_cov:
+                # Если A&R создает, делаем подзадачу дизайнеру
+                session.add(Task(title=f"🎨 Сделать обложку (Саб-задача)", status=TaskStatus.PENDING, deadline=t.deadline-timedelta(days=2), assignee_id=des_id, creator_id=msg.from_user.id, release_id=rel.id, needs_file=True, parent_id=t.id, is_regular=False))
 
-            # Иерархия: Если это "Контроль обложки" (A&R), создаем дочернюю "Сделать обложку" (Дизайнер)
-            if t.get("is_parent_for_cover"):
-                child = Task(
-                    title=f"🎨 Сделать обложку - {title_full}",
-                    status=TaskStatus.PENDING, deadline=dl - timedelta(days=2), # Дизайнер сдает раньше
-                    assignee_id=designer_id, creator_id=message.from_user.id,
-                    release_id=rel.id, parent_id=task.id, needs_file=True, is_regular=False
-                )
-                session.add(child)
-        
         # Питчинг
-        if (d - datetime.now()).days > 14:
-            pt = RELEASE_TEMPLATES["pitching"]
-            session.add(Task(
-                title=f"{pt['title']} - {title_full}", status=TaskStatus.PENDING,
-                deadline=d + timedelta(days=pt['delta']), assignee_id=message.from_user.id,
-                creator_id=message.from_user.id, release_id=rel.id, is_regular=False
-            ))
+        if (data['date'] - datetime.now()).days > 14:
+            session.add(Task(title=f"{PITCHING_TEMPLATE['title']} | {full}", status=TaskStatus.PENDING, deadline=data['date']+timedelta(days=PITCHING_TEMPLATE['delta']), assignee_id=msg.from_user.id, creator_id=msg.from_user.id, release_id=rel.id, is_regular=False))
             
         await session.commit()
-        u = await session.get(User, message.from_user.id)
-        await message.answer("✅ Релиз создан, задачи (и подзадачи) распределены.", reply_markup=get_main_menu(u.role))
+        u = await session.get(User, msg.from_user.id)
+        await msg.answer("✅ Релиз создан!", reply_markup=get_main_menu(u.role))
     await state.clear()
 
-# --- VIEW TASKS & COMPLETE ---
-@router.message(F.text.in_({"📋 Мои Задачи", "🎨 Задачи по обложкам"}))
-async def view_tasks(message: types.Message):
+# --- TASKS VIEW & COMPLETE ---
+@router.message(F.text.in_({"📋 Мои Задачи", "🎨 Задачи по дизайну"}))
+async def view_tasks(msg: types.Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔥 Просрочка", callback_data="flt_over")
-    kb.button(text="🟡 Активные", callback_data="flt_pend")
+    kb.button(text="🔥 Просрочено", callback_data="f_ov")
+    kb.button(text="🟡 Активные", callback_data="f_act")
     kb.adjust(2)
-    await message.answer("🔍 Фильтр:", reply_markup=kb.as_markup())
+    await msg.answer("Фильтр:", reply_markup=kb.as_markup())
 
-@router.callback_query(F.data.startswith("flt_"))
-async def filter_cb(callback: CallbackQuery):
-    ft = callback.data.split("_")[1]
+@router.callback_query(F.data.startswith("f_"))
+async def f_cb(cb: CallbackQuery):
+    ft = cb.data
     async with async_session() as session:
-        q = select(Task).where(Task.assignee_id==callback.from_user.id)
-        if ft == "over": q = q.where(Task.status==TaskStatus.OVERDUE)
-        else: q = q.where(Task.status.in_([TaskStatus.PENDING, TaskStatus.IN_PROGRESS]))
-        
+        q = select(Task).where(Task.assignee_id==cb.from_user.id)
+        q = q.where(Task.status==TaskStatus.OVERDUE) if ft=="f_ov" else q.where(Task.status.in_([TaskStatus.PENDING, TaskStatus.IN_PROGRESS]))
         tasks = (await session.execute(q.order_by(Task.deadline))).scalars().all()
-        if not tasks:
-            await callback.message.edit_text("🎉 Пусто!")
-            return
-        
-        await callback.message.delete()
+        if not tasks: return await cb.message.edit_text("🎉 Пусто")
+        await cb.message.delete()
         for t in tasks:
-            icon = "🔴" if t.status == TaskStatus.OVERDUE else "🟡"
-            kb = InlineKeyboardBuilder()
-            kb.button(text="✅ Завершить", callback_data=f"fin_{t.id}")
-            await callback.message.answer(f"{icon} <b>{t.title}</b>\n⏰ {t.deadline.strftime('%d.%m')}", parse_mode="HTML", reply_markup=kb.as_markup())
+            kb = InlineKeyboardBuilder(); kb.button(text="✅", callback_data=f"fin_{t.id}")
+            await cb.message.answer(f"{'🔴' if t.status==TaskStatus.OVERDUE else '🟡'} <b>{t.title}</b>\n⏰ {t.deadline.strftime('%d.%m')}", parse_mode="HTML", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith("fin_"))
-async def fin_task(callback: CallbackQuery, state: FSMContext):
-    tid = int(callback.data.split("_")[1])
+async def fin_task(cb: CallbackQuery, state: FSMContext):
+    tid = int(cb.data.split("_")[1])
     async with async_session() as session:
         t = await session.get(Task, tid)
-        if not t: return
-        
+        await state.update_data(tid=tid)
         if t.needs_file:
-            await state.update_data(tid=tid)
             await state.set_state(TaskCompletionState.waiting_for_file)
-            await callback.message.answer("📂 Пришлите файл:")
-            await callback.answer()
+            await cb.message.answer("📂 Прикрепите файл:")
         else:
-            t.status = TaskStatus.DONE
-            await session.commit()
-            await callback.message.edit_text(f"✅ Готово: {t.title}")
-            # Логика Родитель-Ребенок
-            if t.parent_id:
-                parent = await session.get(Task, t.parent_id)
-                if parent:
-                    try: await bot.send_message(parent.assignee_id, f"👶 Дочерняя задача '{t.title}' выполнена!\nМожно проверять.")
-                    except: pass
+            await state.set_state(TaskCompletionState.waiting_for_comment)
+            await cb.message.answer("💬 Напишите комментарий (или '-'):")
+        await cb.answer()
 
 @router.message(TaskCompletionState.waiting_for_file, F.document | F.photo)
-async def file_upload(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    fobj = message.document or message.photo[-1]
-    msg = await message.answer("⏳ Загрузка...")
-    
+async def fin_file(msg: types.Message, state: FSMContext):
+    d = await state.get_data()
+    f = msg.document or msg.photo[-1]
+    m = await msg.answer("⏳ Загрузка...")
     async with async_session() as session:
-        t = await session.get(Task, data['tid'])
-        path = await YandexDiskService.upload_file(fobj.file_id, f"task_{t.id}_{fobj.file_unique_id}", bot)
-        t.file_url = path
+        t = await session.get(Task, d['tid'])
+        p = await YandexDiskService.upload_file(f.file_id, f"task_{t.id}", bot)
+        t.file_url = p; t.status = TaskStatus.DONE
+        if msg.caption: t.description = (t.description or "") + f"\nКоммент: {msg.caption}"
+        await session.commit()
+        await m.edit_text("✅ Задача закрыта.")
+        if t.creator_id != t.assignee_id:
+            try: await bot.send_message(t.creator_id, f"✅ Задача {t.title} выполнена (файл).")
+            except: pass
+    await state.clear()
+
+@router.message(TaskCompletionState.waiting_for_comment)
+async def fin_comm(msg: types.Message, state: FSMContext):
+    d = await state.get_data()
+    comm = msg.text if msg.text != "-" else ""
+    async with async_session() as session:
+        t = await session.get(Task, d['tid'])
         t.status = TaskStatus.DONE
+        if comm: t.description = (t.description or "") + f"\nКоммент: {comm}"
         await session.commit()
-        await msg.edit_text("✅ Файл принят, задача закрыта.")
+        await msg.answer("✅")
+        if t.creator_id != t.assignee_id:
+            try: await bot.send_message(t.creator_id, f"✅ Задача {t.title} выполнена.\n{comm}")
+            except: pass
     await state.clear()
 
-# --- ONBOARDING & ARTISTS ---
-@router.message(F.text == "➕ Добавить Артиста")
-async def add_art(message: types.Message, state: FSMContext):
-    await message.answer("Имя:")
-    await state.set_state(ArtistState.waiting_for_name)
+# --- SMM REPORTS (PAGINATION) ---
+@router.message(F.text == "📝 Отчет за сегодня")
+async def smm_rep(msg: types.Message, state: FSMContext):
+    await msg.answer("✍️ Текст:")
+    await state.set_state(SMMReportState.waiting_for_text)
 
-@router.message(ArtistState.waiting_for_name)
-async def save_art(message: types.Message, state: FSMContext):
+@router.message(SMMReportState.waiting_for_text)
+async def smm_save(msg: types.Message, state: FSMContext):
     async with async_session() as session:
-        session.add(Artist(name=message.text, ar_manager_id=message.from_user.id))
+        session.add(Report(user_id=msg.from_user.id, text=msg.text))
         await session.commit()
-    await message.answer("✅ Артист добавлен.")
+    await msg.answer("✅")
     await state.clear()
 
-@router.callback_query(F.data.startswith("onb_"))
-async def onb_ans(callback: CallbackQuery):
-    _, aid, typ, ans = callback.data.split("_")
-    if ans == "no": 
-        await callback.message.edit_text("🕐 Ок, позже.")
-        return
-    async with async_session() as session:
-        a = await session.get(Artist, int(aid))
-        if typ == "contract": a.contract_signed = True
-        elif typ == "yt_note": a.youtube_note = True
-        # ... остальные проверки
-        await session.commit()
-    await callback.message.edit_text("✅ Статус обновлен.")
+@router.message(F.text == "📅 Архив отчетов")
+async def smm_hist_start(msg: types.Message):
+    await show_reports(msg, 0)
 
-# --- SCHEDULER (FULL LOGIC) ---
-async def scheduler_jobs():
+async def show_reports(msg_or_cb, page):
+    async with async_session() as session:
+        uid = msg_or_cb.from_user.id
+        reps = (await session.execute(select(Report).where(Report.user_id==uid).order_by(desc(Report.created_at)).offset(page*5).limit(5))).scalars().all()
+        
+        if not reps and page==0: 
+            if isinstance(msg_or_cb, types.CallbackQuery): await msg_or_cb.message.edit_text("📭 Пусто")
+            else: await msg_or_cb.answer("📭 Пусто")
+            return
+
+        txt = f"📜 <b>Отчеты (Стр. {page+1}):</b>\n\n"
+        for r in reps: txt += f"🔹 {r.created_at.strftime('%d.%m %H:%M')}: {r.text[:40]}...\n"
+        
+        kb = InlineKeyboardBuilder()
+        if page > 0: kb.button(text="⬅️", callback_data=f"rpage_{page-1}")
+        if len(reps) == 5: kb.button(text="➡️", callback_data=f"rpage_{page+1}")
+        
+        if isinstance(msg_or_cb, types.CallbackQuery): await msg_or_cb.message.edit_text(txt, parse_mode="HTML", reply_markup=kb.as_markup())
+        else: await msg_or_cb.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data.startswith("rpage_"))
+async def smm_page(cb: CallbackQuery):
+    await show_reports(cb, int(cb.data.split("_")[1]))
+
+@router.message(F.text == "📀 Релизы")
+async def list_rel(msg: types.Message):
+    async with async_session() as session:
+        rels = (await session.execute(select(Release).order_by(Release.release_date))).scalars().all()
+        if not rels: await msg.answer("📭")
+        u = await session.get(User, msg.from_user.id)
+        for r in rels:
+            kb = InlineKeyboardBuilder()
+            if u.role == UserRole.FOUNDER: kb.button(text="🗑", callback_data=f"delrel_{r.id}")
+            await msg.answer(f"💿 <b>{r.artist_name} - {r.title}</b>\n📅 {r.release_date.strftime('%d.%m.%Y')}", parse_mode="HTML", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data.startswith("delrel_"))
+async def del_rel(cb: CallbackQuery):
+    async with async_session() as session:
+        r = await session.get(Release, int(cb.data.split("_")[1]))
+        if r: await session.delete(r); await session.commit()
+    await cb.message.edit_text("❌ Удалено")
+
+# --- SCHEDULER (FULL SPEC) ---
+async def jobs():
     async with async_session() as session:
         now = datetime.now()
+        today_date = now.date()
         
-        # 1. Просрочка (Ежечасно)
+        # 1. SMM ГЕНЕРАЦИЯ (10:00)
+        if now.hour == 10:
+            smms = (await session.execute(select(User).where(User.role == UserRole.SMM))).scalars().all()
+            for smm in smms:
+                for tmpl in SMM_DAILY_TEMPLATES:
+                    exists = (await session.execute(select(Task).where(Task.assignee_id==smm.id, Task.title==tmpl, func.date(Task.deadline)==today_date))).scalar_one_or_none()
+                    if not exists: session.add(Task(title=tmpl, status=TaskStatus.PENDING, deadline=now.replace(hour=23,minute=59), assignee_id=smm.id, creator_id=smm.id, is_regular=True))
+        
+        # 2. РЕЛИЗЫ УВЕДОМЛЕНИЯ (10:00) - ВОССТАНОВЛЕНО!
+        if now.hour == 10:
+            # 1 и 2 дня до релиза
+            rels = (await session.execute(select(Release))).scalars().all()
+            for r in rels:
+                days = (r.release_date.date() - today_date).days
+                if days in [1, 2]:
+                    try: await bot.send_message(r.created_by, f"🔔 Релиз {r.title} через {days} дн!")
+                    except: pass
+                # Питчинг Алерт (3 дня)
+                if days == 3:
+                    pt = (await session.execute(select(Task).where(Task.release_id==r.id, Task.title.like("%Питчинг%"), Task.status!=TaskStatus.DONE))).scalar_one_or_none()
+                    if pt:
+                        founders = (await session.execute(select(User).where(User.role == UserRole.FOUNDER))).scalars().all()
+                        for f in founders:
+                            try: await bot.send_message(f.id, f"🔥 Питчинг для {r.title} не готов! Релиз через 3 дня.")
+                            except: pass
+
+        # 3. ОНБОРДИНГ (15:00)
+        if now.hour == 15:
+            # Контракт и YouTube привязка
+            arts = (await session.execute(select(Artist).where(Artist.contract_signed == False))).scalars().all()
+            for a in arts:
+                kb = InlineKeyboardBuilder(); kb.button(text="✅", callback_data=f"onb_{a.id}_contract_yes"); kb.button(text="❌", callback_data=f"onb_{a.id}_contract_no")
+                try: await bot.send_message(a.created_by_id, f"📝 Контракт {a.name}?", reply_markup=kb.as_markup())
+                except: pass
+            
+            # YouTube Нотка (В ДЕНЬ РЕЛИЗА) - ВОССТАНОВЛЕНО!
+            rels_today = (await session.execute(select(Release).where(func.date(Release.release_date) == today_date))).scalars().all()
+            for r in rels_today:
+                a = await session.get(Artist, (await session.execute(select(Artist).where(Artist.name==r.artist_name))).scalar_one().id)
+                if not a.youtube_note:
+                    try: await bot.send_message(r.created_by, f"📺 Релиз сегодня! Подай на Нотку для {a.name}")
+                    except: pass
+
+        # 4. MUSIXMATCH (Понедельник)
+        if now.weekday() == 0 and now.hour == 14:
+            arts = (await session.execute(select(Artist).where(Artist.musixmatch_profile == False))).scalars().all()
+            for a in arts:
+                try: await bot.send_message(a.created_by_id, f"🔔 Musixmatch профиль {a.name}?")
+                except: pass
+
+        # 5. ТЕКУЩИЕ ЗАДАЧИ (Каждый час)
+        # Просрочка
         over = (await session.execute(select(Task).where(Task.deadline < now, Task.status.in_([TaskStatus.PENDING, TaskStatus.IN_PROGRESS])))).scalars().all()
         for t in over:
             t.status = TaskStatus.OVERDUE
             try: await bot.send_message(t.assignee_id, f"⚠️ ПРОСРОЧЕНО: {t.title}")
             except: pass
-            
-        # 2. Дедлайны (каждые 6ч - но проверяем попадание в диапазон)
+        
+        # Дедлайн 6ч
         near = (await session.execute(select(Task).where(Task.deadline > now, Task.deadline < now + timedelta(hours=24), Task.status!=TaskStatus.DONE))).scalars().all()
         for t in near:
-             # Чтобы не спамить каждый час, можно проверять время (упростим: шлем если 23-24ч осталось или 5-6ч)
-             h = (t.deadline - now).total_seconds() / 3600
-             if 23 < h < 24 or 5 < h < 6:
-                 try: await bot.send_message(t.assignee_id, f"⏰ Скоро дедлайн: {t.title}")
-                 except: pass
-        
-        # 3. YouTube Нотка (День релиза + Еженедельно)
-        # Логика: Ищем артистов, у которых есть релиз СЕГОДНЯ, и нотки еще нет
-        today_releases = (await session.execute(select(Release).where(func.date(Release.release_date) == func.date(now)))).scalars().all()
-        for r in today_releases:
-            art = await session.get(Artist, r.artist_id)
-            if not art.youtube_note:
-                kb = InlineKeyboardBuilder()
-                kb.button(text="Да", callback_data=f"onb_{art.id}_yt_note_yes")
-                kb.button(text="Нет", callback_data=f"onb_{art.id}_yt_note_no")
-                try: await bot.send_message(art.ar_manager_id, f"📺 День релиза! Подали заявку на нотку для {art.name}?", reply_markup=kb.as_markup())
+            h = (t.deadline - now).total_seconds() / 3600
+            if 5 < h < 6:
+                try: await bot.send_message(t.assignee_id, f"⏰ Скоро дедлайн: {t.title}")
                 except: pass
-                
-        # 4. Питчинг Алерт (3 дня)
-        crit_rels = (await session.execute(select(Release).where(func.date(Release.release_date) == func.date(now + timedelta(days=3))))).scalars().all()
-        founders = (await session.execute(select(User).where(User.role == UserRole.FOUNDER))).scalars().all()
-        for r in crit_rels:
-            pt = (await session.execute(select(Task).where(Task.release_id==r.id, Task.title.like("%Питчинг%"), Task.status!=TaskStatus.DONE))).scalar_one_or_none()
-            if pt:
-                msg = f"🔥 СРОЧНО! Питчинг для {r.title} не сдан (3 дня до релиза)!"
-                for f in founders:
-                    try: await bot.send_message(f.id, msg)
-                    except: pass
-        
+
         await session.commit()
 
+@router.callback_query(F.data.startswith("onb_"))
+async def onb_cb(cb: CallbackQuery):
+    _, aid, typ, ans = cb.data.split("_")
+    if ans == "no": return await cb.message.edit_text("🕐 Позже")
+    async with async_session() as session:
+        a = await session.get(Artist, int(aid))
+        if typ=="contract": a.contract_signed=True
+        # ... (остальные типы)
+        await session.commit()
+    await cb.message.edit_text("✅")
+
 async def main():
-    # АВТО-ЧИСТКА БАЗЫ ДАННЫХ ПРИ ЗАПУСКЕ (Решает все конфликты схем)
     await init_db_and_clean()
-    print("✅ База данных очищена и пересоздана.")
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(scheduler_jobs, IntervalTrigger(hours=1))
-    scheduler.start()
-
+    print("✅ DB READY")
+    s = AsyncIOScheduler()
+    s.add_job(jobs, IntervalTrigger(hours=1))
+    s.start()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
