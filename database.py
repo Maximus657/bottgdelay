@@ -8,30 +8,22 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
 load_dotenv()
 
-# --- ИСПРАВЛЕНИЕ ВАШЕЙ ОШИБКИ ЗДЕСЬ ---
-raw_url = os.getenv("DATABASE_URL")
-
-if not raw_url:
-    raise ValueError("DATABASE_URL env variable is missing!")
-
-# Автоматически заменяем протокол на асинхронный, если указан обычный
+# Логика исправления ссылки для Dokploy/Docker
+raw_url = os.getenv("DATABASE_URL", "")
 if raw_url.startswith("postgresql://"):
     DATABASE_URL = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 else:
     DATABASE_URL = raw_url
-# ---------------------------------------
 
-# Создаем движок и сессию
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
     pass
 
-# --- ENUMS (ПЕРЕЧИСЛЕНИЯ) ---
+# --- ENUMS ---
 class UserRole(str, Enum):
     FOUNDER = "Основатель"
     AR_MANAGER = "A&R-менеджер"
@@ -49,11 +41,10 @@ class ReleaseType(str, Enum):
     SINGLE_50_50 = "Сингл 50/50"
     ALBUM = "Альбом"
 
-# --- МОДЕЛИ (ТАБЛИЦЫ) ---
+# --- TABLES ---
 
 class User(Base):
     __tablename__ = "users"
-    
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=True)
     full_name: Mapped[str] = mapped_column(String)
@@ -62,33 +53,31 @@ class User(Base):
 
 class Artist(Base):
     __tablename__ = "artists"
-    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String)
     ar_manager_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
-    # Флаги онбординга
+    # Onboarding flags
     contract_signed: Mapped[bool] = mapped_column(Boolean, default=False)
     musixmatch_profile: Mapped[bool] = mapped_column(Boolean, default=False)
     musixmatch_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     youtube_note: Mapped[bool] = mapped_column(Boolean, default=False)
     youtube_binding: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    first_release_date: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
 class Release(Base):
     __tablename__ = "releases"
-    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
     release_type: Mapped[str] = mapped_column(String)
     artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"))
     release_date: Mapped[datetime] = mapped_column(DateTime)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    
+    # Связь для каскадного удаления задач при удалении релиза
+    tasks: Mapped[List["Task"]] = relationship("Task", back_populates="release", cascade="all, delete-orphan")
 
 class Task(Base):
     __tablename__ = "tasks"
-    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(Text, nullable=True)
@@ -97,17 +86,16 @@ class Task(Base):
     
     assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    release_id: Mapped[int] = mapped_column(ForeignKey("releases.id"), nullable=True)
-    parent_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    
+    # Каскадное удаление
+    release_id: Mapped[Optional[int]] = mapped_column(ForeignKey("releases.id", ondelete="CASCADE"), nullable=True)
+    release: Mapped[Optional["Release"]] = relationship("Release", back_populates="tasks")
     
     needs_file: Mapped[bool] = mapped_column(Boolean, default=False)
     file_url: Mapped[str] = mapped_column(String, nullable=True)
-    
-    is_regular: Mapped[bool] = mapped_column(Boolean, default=False)
 
 class Report(Base):
     __tablename__ = "reports"
-    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     text: Mapped[str] = mapped_column(Text)
