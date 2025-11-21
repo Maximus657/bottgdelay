@@ -24,9 +24,9 @@ from apscheduler.triggers.cron import CronTrigger
 # 0. КОНФИГУРАЦИЯ
 # ==============================================================================
 
-# Берем из переменных окружения (Dokploy Environment)
 API_TOKEN = os.getenv('API_TOKEN')
-# Превращаем строку "id1,id2" в список чисел
+
+# Парсим ID админов из строки "123,456" в список чисел
 admin_ids_str = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(x) for x in admin_ids_str.split(',')] if admin_ids_str else []
 
@@ -99,18 +99,15 @@ ydisk = YandexDiskService(YANDEX_DISK_TOKEN, YANDEX_UPLOAD_FOLDER)
 class Database:
     def __init__(self, dsn):
         self.dsn = dsn
-        # Подключаемся сразу, autocommit=True чтобы не делать conn.commit() каждый раз вручную
         self.conn = psycopg2.connect(dsn)
         self.conn.autocommit = True
         self.init_db()
 
     def get_cursor(self):
-        # DictCursor позволяет обращаться к полям по имени, как в sqlite row_factory
         return self.conn.cursor(cursor_factory=DictCursor)
 
     def init_db(self):
         with self.get_cursor() as cur:
-            # Пользователи (BIGINT для Telegram ID)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id BIGINT PRIMARY KEY,
@@ -118,8 +115,6 @@ class Database:
                     role TEXT
                 )
             """)
-            
-            # Артисты (SERIAL вместо AUTOINCREMENT)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS artists (
                     id SERIAL PRIMARY KEY,
@@ -133,8 +128,6 @@ class Database:
                     flag_yt_link INTEGER DEFAULT 0
                 )
             """)
-
-            # Релизы
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS releases (
                     id SERIAL PRIMARY KEY,
@@ -145,8 +138,6 @@ class Database:
                     created_by BIGINT
                 )
             """)
-
-            # Задачи
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id SERIAL PRIMARY KEY,
@@ -163,8 +154,6 @@ class Database:
                     comment TEXT
                 )
             """)
-
-            # Отчеты
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reports (
                     id SERIAL PRIMARY KEY,
@@ -187,7 +176,6 @@ class Database:
     
     def add_user(self, uid, name, role):
         with self.get_cursor() as cur:
-            # Postgres синтаксис для UPSERT (Insert or Update)
             cur.execute("""
                 INSERT INTO users (telegram_id, name, role) VALUES (%s, %s, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role
@@ -215,8 +203,6 @@ class Database:
         u = self.get_user(uid)
         if u: return f"<a href='tg://user?id={uid}'>{u['name']}</a>"
         return f"ID:{uid}"
-    
-    # --- Методы для задач и прочего (адаптированные под %s) ---
     
     def create_task(self, title, desc, assigned, created, rel_id, deadline, req_file=0, parent_id=None):
         with self.get_cursor() as cur:
@@ -247,9 +233,6 @@ class Database:
             else:
                 cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, tid))
 
-    # --- Остальные методы (выборочно адаптированы ниже в коде) ---
-
-# Инициализация с URL из env
 db = Database(DATABASE_URL)
 
 # ==============================================================================
@@ -743,9 +726,25 @@ async def smm_start(m: types.Message, state: FSMContext):
 @dp.message(SMMReportState.text)
 async def smm_save(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
+    
+    # 1. Save to DB
     with db.get_cursor() as cur:
-        cur.execute("INSERT INTO reports (user_id, report_date, text) VALUES (%s, %s, %s)", (m.from_user.id, datetime.date.today(), m.text))
-    await m.answer("✅ Принято.", reply_markup=get_main_kb('smm'))
+        cur.execute("INSERT INTO reports (user_id, report_date, text) VALUES (%s, %s, %s)", 
+                    (m.from_user.id, datetime.date.today(), m.text))
+    
+    # 2. Notify Admins (FIXED)
+    reporter = db.get_user_link(m.from_user.id)
+    report_msg = (
+        f"📊 <b>НОВЫЙ SMM ОТЧЕТ</b>\n"
+        f"👤 От: {reporter}\n"
+        f"📅 Дата: {datetime.date.today()}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{m.text}"
+    )
+    for admin_id in ADMIN_IDS:
+        await notify_user(admin_id, report_msg)
+
+    await m.answer("✅ Отчет сохранен и отправлен руководству.", reply_markup=get_main_kb('smm'))
     await state.clear()
 
 @dp.message(F.text == "📅 Мои отчеты")
