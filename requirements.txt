@@ -1,6 +1,3 @@
 aiogram>=3.0
-sqlalchemy
-asyncpg
 apscheduler
-python-dotenv
-aiohttp
+requests
