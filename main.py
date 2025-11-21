@@ -19,24 +19,24 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
 # --- ЗАГРУЗКА КОНФИГУРАЦИИ ---
-load_dotenv()  # Загружаем .env если запускаем локально
+load_dotenv()
 
 API_TOKEN = os.getenv("BOT_TOKEN")
-# Парсим админов из строки "123,456" в список чисел [123, 456]
+# Парсим админов
 admin_env = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(id.strip()) for id in admin_env.split(",") if id.strip().isdigit()]
 YANDEX_DISK_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Исправление URL для SQLAlchemy (нужен драйвер asyncpg)
+# Исправление URL для SQLAlchemy
 if DATABASE_URL and not DATABASE_URL.startswith("postgresql+asyncpg"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- БАЗА ДАННЫХ (PostgreSQL) ---
+# --- БАЗА ДАННЫХ ---
 Base = declarative_base()
 
 class UserRole(str, Enum):
@@ -47,10 +47,9 @@ class UserRole(str, Enum):
 
 class User(Base):
     __tablename__ = 'users'
-    # В Postgres лучше использовать BigInteger для ID телеграма, так как они большие
-    id = Column(BigInteger, primary_key=True)  
+    id = Column(BigInteger, primary_key=True)  # Telegram ID
     username = Column(String, nullable=True)
-    role = Column(String)  # founder, ar, designer, smm
+    role = Column(String)
     full_name = Column(String, nullable=True)
 
 class Artist(Base):
@@ -59,7 +58,6 @@ class Artist(Base):
     name = Column(String)
     manager_id = Column(BigInteger, ForeignKey('users.id'))
     
-    # Флаги онбординга
     contract_signed = Column(Boolean, default=False)
     musixmatch_created = Column(Boolean, default=False)
     musixmatch_verified = Column(Boolean, default=False)
@@ -72,7 +70,7 @@ class Release(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String)
     artist_id = Column(Integer, ForeignKey('artists.id'))
-    release_type = Column(String) # 80/20, 50/50
+    release_type = Column(String)
     release_date = Column(DateTime(timezone=False))
     created_by = Column(BigInteger, ForeignKey('users.id'))
     
@@ -96,36 +94,13 @@ class Task(Base):
     
     release = relationship("Release", back_populates="tasks")
 
-# Создание движка PostgreSQL
+# Инициализация DB
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL не найден в .env")
+    logger.error("DATABASE_URL не найден!")
+    exit(1)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# --- УТИЛИТЫ ---
-
-async def upload_to_yandex_disk(file_path, filename):
-    """Загрузка файла на Я.Диск (заглушка, если токена нет)"""
-    if not YANDEX_DISK_TOKEN or "ВАШ_" in YANDEX_DISK_TOKEN:
-        return f"https://fake-disk.url/{filename}"
-
-    headers = {'Authorization': f'OAuth {YANDEX_DISK_TOKEN}'}
-    try:
-        # 1. Получаем URL для загрузки
-        resp = requests.get(
-            'https://cloud-api.yandex.net/v1/disk/resources/upload',
-            params={'path': f'/MusicLabelBot/{filename}', 'overwrite': 'true'},
-            headers=headers
-        )
-        if resp.status_code == 200:
-            href = resp.json().get('href')
-            # 2. Загружаем файл (в реальном коде file_path должен быть байтовым потоком)
-            # Здесь упрощение для примера
-            return "Файл успешно отправлен (эмуляция)"
-    except Exception as e:
-        logger.error(f"Ошибка Я.Диска: {e}")
-    return None
 
 # --- FSM СОСТОЯНИЯ ---
 class ReleaseForm(StatesGroup):
@@ -136,7 +111,6 @@ class ReleaseForm(StatesGroup):
 
 class TaskCompletion(StatesGroup):
     waiting_for_file = State()
-    waiting_for_comment = State()
 
 class NewArtist(StatesGroup):
     waiting_for_name = State()
@@ -147,8 +121,7 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
-# --- MIDDLEWARE И AUTH ---
-
+# --- UTILS ---
 async def is_authorized(user_id):
     async with AsyncSessionLocal() as session:
         user = await session.get(User, user_id)
@@ -159,14 +132,13 @@ async def get_user_role(user_id):
         user = await session.get(User, user_id)
         return user.role if user else None
 
-# --- КЛАВИАТУРЫ ---
-
 def get_main_menu(role):
     kb = []
     if role == UserRole.FOUNDER:
         kb = [
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="👥 Сотрудники")],
-            [KeyboardButton(text="❌ Удалить релиз"), KeyboardButton(text="🚨 Алерт Питчинг")]
+            [KeyboardButton(text="❌ Удалить релиз"), KeyboardButton(text="🚨 Алерт Питчинг")],
+             [KeyboardButton(text="📋 Все задачи")]
         ]
     elif role == UserRole.AR:
         kb = [
@@ -179,12 +151,11 @@ def get_main_menu(role):
         ]
     elif role == UserRole.SMM:
         kb = [
-            [KeyboardButton(text="📱 Задачи SMM"), KeyboardButton(text="📝 Отчет")]
+            [KeyboardButton(text="📱 Задачи SMM"), KeyboardButton(text="✅ Выполненные")]
         ]
-    
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- ОБРАБОТЧИКИ (HANDLERS) ---
+# --- HANDLERS: START & AUTH ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -198,339 +169,364 @@ async def cmd_start(message: types.Message):
                 new_user = User(id=user_id, username=message.from_user.username, role=UserRole.FOUNDER, full_name=message.from_user.full_name)
                 session.add(new_user)
                 await session.commit()
-                await message.answer("👑 Вы опознаны как Основатель (через ENV). Добро пожаловать.")
+                await message.answer("👑 Вы зарегистрированы как Основатель.")
     
     if await is_authorized(user_id):
         role = await get_user_role(user_id)
         await message.answer(f"👋 С возвращением! Ваша роль: {role}", reply_markup=get_main_menu(role))
     else:
-        await message.answer("⛔️ Доступ запрещен. Обратитесь к администратору для регистрации.")
+        await message.answer("⛔️ Доступ запрещен. Ваш ID не найден в базе.")
 
-# --- ЛОГИКА A&R (РЕЛИЗЫ) ---
+# --- HANDLERS: FOUNDER (ОСНОВАТЕЛЬ) ---
 
-@dp.message(F.text == "💿 Новый релиз")
-async def start_release_creation(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    role = await get_user_role(user_id)
-    
-    if role != UserRole.AR and user_id not in ADMIN_IDS:
+@dp.message(F.text == "👥 Сотрудники")
+async def list_employees(message: types.Message):
+    if await get_user_role(message.from_user.id) != UserRole.FOUNDER:
         return
     
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Artist))
-        artists = result.scalars().all()
+        users = (await session.execute(select(User))).scalars().all()
+    
+    text = "<b>Сотрудники:</b>\n"
+    for u in users:
+        text += f"👤 {u.full_name} (@{u.username}) — <b>{u.role}</b> (ID: {u.id})\n"
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(F.text == "📊 Статистика")
+async def show_stats(message: types.Message):
+    if await get_user_role(message.from_user.id) != UserRole.FOUNDER:
+        return
+
+    async with AsyncSessionLocal() as session:
+        u_count = await session.scalar(select(func.count(User.id)))
+        r_count = await session.scalar(select(func.count(Release.id)))
+        t_active = await session.scalar(select(func.count(Task.id)).where(Task.status.in_(['pending', 'in_progress'])))
+        t_overdue = await session.scalar(select(func.count(Task.id)).where(Task.status == 'overdue'))
+    
+    await message.answer(
+        f"📊 <b>Статистика:</b>\n\n"
+        f"👥 Людей: {u_count}\n"
+        f"💿 Релизов: {r_count}\n"
+        f"⚡️ Активных задач: {t_active}\n"
+        f"🔥 Просрочено: {t_overdue}", 
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "❌ Удалить релиз")
+async def delete_release_menu(message: types.Message):
+    if await get_user_role(message.from_user.id) != UserRole.FOUNDER:
+        return
+
+    async with AsyncSessionLocal() as session:
+        releases = (await session.execute(select(Release))).scalars().all()
+    
+    if not releases:
+        await message.answer("Нет релизов.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"❌ {r.title}", callback_data=f"del_rel_{r.id}")] for r in releases
+    ])
+    await message.answer("Выберите релиз для удаления:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("del_rel_"))
+async def process_delete_release(callback: types.CallbackQuery):
+    rid = int(callback.data.split("_")[2])
+    async with AsyncSessionLocal() as session:
+        rel = await session.get(Release, rid)
+        if rel:
+            await session.delete(rel)
+            await session.commit()
+            await callback.message.edit_text(f"✅ Релиз '{rel.title}' удален.")
+        else:
+            await callback.message.edit_text("Релиз не найден.")
+
+@dp.message(F.text == "🚨 Алерт Питчинг")
+async def manual_pitch_alert(message: types.Message):
+    await message.answer("🔄 Проверка запущена...")
+    await critical_pitching_check()
+    await message.answer("✅ Проверка завершена.")
+
+# --- HANDLERS: A&R (РЕЛИЗЫ И АРТИСТЫ) ---
+
+@dp.message(F.text == "🎤 Новый артист")
+async def add_artist_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите имя артиста:")
+    await state.set_state(NewArtist.waiting_for_name)
+
+@dp.message(NewArtist.waiting_for_name)
+async def add_artist_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Дата первого релиза (ДД.ММ.ГГГГ) или напишите 'нет':")
+    await state.set_state(NewArtist.waiting_for_release_date)
+
+@dp.message(NewArtist.waiting_for_release_date)
+async def add_artist_final(message: types.Message, state: FSMContext):
+    date = None
+    if "нет" not in message.text.lower():
+        try:
+            date = datetime.strptime(message.text, "%d.%m.%Y")
+        except: pass
+    
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        art = Artist(name=data['name'], manager_id=message.from_user.id, first_release_date=date)
+        session.add(art)
+        await session.commit()
+    
+    await message.answer(f"✅ Артист {data['name']} создан.")
+    await state.clear()
+
+@dp.message(F.text == "💿 Новый релиз")
+async def new_release_start(message: types.Message, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        artists = (await session.execute(select(Artist))).scalars().all()
     
     if not artists:
-        await message.answer("Сначала создайте артиста!")
+        await message.answer("Нет артистов. Создайте сначала артиста.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=a.name, callback_data=f"sel_art_{a.id}")] for a in artists
     ])
-    
-    await message.answer("Выберите основного артиста:", reply_markup=kb)
+    await message.answer("Выберите артиста:", reply_markup=kb)
     await state.set_state(ReleaseForm.waiting_for_artist)
 
 @dp.callback_query(F.data.startswith("sel_art_"))
-async def process_artist_selection(callback: types.CallbackQuery, state: FSMContext):
-    artist_id = int(callback.data.split("_")[2])
-    await state.update_data(artist_id=artist_id)
-    await callback.message.answer("Введите название релиза:")
+async def new_release_artist(callback: types.CallbackQuery, state: FSMContext):
+    aid = int(callback.data.split("_")[2])
+    await state.update_data(artist_id=aid)
+    await callback.message.answer("Название релиза:")
     await state.set_state(ReleaseForm.waiting_for_title)
 
 @dp.message(ReleaseForm.waiting_for_title)
-async def process_release_title(message: types.Message, state: FSMContext):
+async def new_release_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="80/20", callback_data="type_8020")],
         [InlineKeyboardButton(text="50/50", callback_data="type_5050")]
     ])
-    await message.answer("Выберите тип сделки:", reply_markup=kb)
+    await message.answer("Тип сделки:", reply_markup=kb)
     await state.set_state(ReleaseForm.waiting_for_type)
 
 @dp.callback_query(F.data.startswith("type_"))
-async def process_release_type(callback: types.CallbackQuery, state: FSMContext):
-    r_type = callback.data.split("_")[1]
-    await state.update_data(release_type=r_type)
-    await callback.message.answer("Введите дату релиза (формат ДД.ММ.ГГГГ):")
+async def new_release_type(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(rtype=callback.data.split("_")[1])
+    await callback.message.answer("Дата релиза (ДД.ММ.ГГГГ):")
     await state.set_state(ReleaseForm.waiting_for_date)
 
 @dp.message(ReleaseForm.waiting_for_date)
-async def process_release_date(message: types.Message, state: FSMContext):
+async def new_release_finish(message: types.Message, state: FSMContext):
     try:
-        date_obj = datetime.strptime(message.text, "%d.%m.%Y")
-    except ValueError:
-        await message.answer("Неверный формат. Попробуйте еще раз (ДД.ММ.ГГГГ).")
+        rdate = datetime.strptime(message.text, "%d.%m.%Y")
+    except:
+        await message.answer("Ошибка формата даты.")
         return
 
     data = await state.get_data()
     
     async with AsyncSessionLocal() as session:
-        new_release = Release(
-            title=data['title'],
-            artist_id=data['artist_id'],
-            release_type=data['release_type'],
-            release_date=date_obj,
+        # 1. Create Release
+        rel = Release(
+            title=data['title'], artist_id=data['artist_id'], 
+            release_type=data['rtype'], release_date=rdate, 
             created_by=message.from_user.id
         )
-        session.add(new_release)
-        await session.flush() 
-        
-        # Шаблоны задач
-        tasks_to_create = []
-        tasks_to_create.append({
-            "title": f"Загрузить трек {data['title']}", "role": UserRole.AR, 
-            "delta": -14, "file": False
-        })
-        tasks_to_create.append({
-            "title": f"Создать обложку для {data['title']}", "role": UserRole.DESIGNER, 
-            "delta": -20, "file": True
-        })
-        
-        if data['release_type'] == "8020":
-            tasks_to_create.append({
-                "title": f"Питчинг Spotify {data['title']}", "role": UserRole.AR, 
-                "delta": -10, "file": False
-            })
+        session.add(rel)
+        await session.flush()
 
-        for task_tmpl in tasks_to_create:
-            result = await session.execute(select(User).where(User.role == task_tmpl['role']))
-            worker = result.scalars().first()
-            
-            if worker:
-                deadline = date_obj + timedelta(days=task_tmpl['delta'])
-                new_task = Task(
-                    title=task_tmpl['title'],
-                    description="Автоматическая задача релиза",
-                    status="pending",
-                    deadline=deadline,
-                    assigned_to=worker.id,
-                    created_by=message.from_user.id,
-                    release_id=new_release.id,
-                    requires_file=task_tmpl['file']
+        # 2. Generate Tasks
+        # Находим исполнителей (берем первых попавшихся для упрощения)
+        ar_user = await session.scalar(select(User).where(User.role == UserRole.AR).limit(1))
+        des_user = await session.scalar(select(User).where(User.role == UserRole.DESIGNER).limit(1))
+        
+        # Если нет дизайнера, назначаем A&R или Основателя
+        if not des_user: des_user = ar_user
+
+        tasks_def = [
+            {"t": f"Загрузка {data['title']}", "u": ar_user, "d": -14, "f": False},
+            {"t": f"Обложка {data['title']}", "u": des_user, "d": -20, "f": True},
+        ]
+        if data['rtype'] == "8020":
+            tasks_def.append({"t": f"Питчинг {data['title']}", "u": ar_user, "d": -10, "f": False})
+
+        for td in tasks_def:
+            if td['u']:
+                new_t = Task(
+                    title=td['t'], description="Auto", status="pending",
+                    deadline=rdate + timedelta(days=td['d']),
+                    assigned_to=td['u'].id, created_by=message.from_user.id,
+                    release_id=rel.id, requires_file=td['f']
                 )
-                session.add(new_task)
+                session.add(new_t)
                 try:
-                    await bot.send_message(worker.id, f"🆕 Новая задача: {task_tmpl['title']}\nДедлайн: {deadline.strftime('%d.%m')}")
+                    await bot.send_message(td['u'].id, f"🆕 Новая задача: {td['t']}")
                 except: pass
-
-        await session.commit()
         
-    await message.answer(f"✅ Релиз '{data['title']}' создан, задачи распределены!")
+        await session.commit()
+    
+    await message.answer(f"✅ Релиз '{data['title']}' создан!")
     await state.clear()
 
-# --- УПРАВЛЕНИЕ ЗАДАЧАМИ ---
+@dp.message(F.text == "🆘 PANIC BUTTON")
+async def panic_button(message: types.Message):
+    for aid in ADMIN_IDS:
+        await bot.send_message(aid, f"🆘 <b>ТРЕВОГА от {message.from_user.full_name}!</b>\nСрочно свяжитесь!", parse_mode="HTML")
+    await message.answer("Сигнал отправлен администраторам.")
 
-@dp.message(lambda m: m.text and ("Задачи" in m.text or "Мои задачи" in m.text))
-async def show_tasks(message: types.Message):
-    user_id = message.from_user.id
+# --- HANDLERS: TASKS (COMMON) ---
+
+@dp.message(F.text.in_({"📋 Мои задачи", "🎨 Задачи (Обложки)", "📱 Задачи SMM", "📋 Все задачи"}))
+async def show_my_tasks(message: types.Message):
+    uid = message.from_user.id
+    role = await get_user_role(uid)
     
     async with AsyncSessionLocal() as session:
-        stmt = select(Task).where(
-            Task.assigned_to == user_id,
-            Task.status.in_(['pending', 'in_progress', 'overdue'])
-        ).order_by(Task.deadline)
-        result = await session.execute(stmt)
-        tasks = result.scalars().all()
-    
+        query = select(Task).where(Task.status.in_(['pending', 'in_progress', 'overdue'])).order_by(Task.deadline)
+        
+        # Если не основатель - видим только свои
+        if role != UserRole.FOUNDER:
+            query = query.where(Task.assigned_to == uid)
+            
+        tasks = (await session.execute(query)).scalars().all()
+
     if not tasks:
-        await message.answer("🎉 У вас нет активных задач!")
+        await message.answer("Задач нет.")
         return
-    
-    for task in tasks:
-        status_icon = "🔥" if task.status == "overdue" else "⏳"
-        deadline_str = task.deadline.strftime('%d.%m %H:%M') if task.deadline else "Без срока"
-        text = f"{status_icon} <b>{task.title}</b>\nДедлайн: {deadline_str}"
+
+    for t in tasks:
+        emoji = "🔥" if t.status == "overdue" else "⏳"
+        d_str = t.deadline.strftime("%d.%m") if t.deadline else "?"
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Завершить задачу", callback_data=f"done_{task.id}")]
+            [InlineKeyboardButton(text="✅ Завершить", callback_data=f"done_{t.id}")]
         ])
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        await message.answer(f"{emoji} <b>{t.title}</b>\nДедлайн: {d_str}\nСтатус: {t.status}", reply_markup=kb, parse_mode="HTML")
+
+@dp.message(F.text == "✅ Выполненные")
+async def show_done_tasks(message: types.Message):
+    uid = message.from_user.id
+    async with AsyncSessionLocal() as session:
+        tasks = (await session.execute(select(Task).where(Task.assigned_to == uid, Task.status == "done").limit(10))).scalars().all()
+    
+    text = "Последние выполненные:\n" + "\n".join([f"✅ {t.title}" for t in tasks])
+    await message.answer(text if tasks else "Пусто.")
 
 @dp.callback_query(F.data.startswith("done_"))
-async def complete_task_start(callback: types.CallbackQuery, state: FSMContext):
-    task_id = int(callback.data.split("_")[1])
+async def done_task_click(callback: types.CallbackQuery, state: FSMContext):
+    tid = int(callback.data.split("_")[1])
     
     async with AsyncSessionLocal() as session:
-        task = await session.get(Task, task_id)
+        task = await session.get(Task, tid)
         if not task:
             await callback.message.answer("Задача не найдена.")
             return
-
+        
         if task.requires_file:
-            await state.update_data(task_id=task_id)
-            await callback.message.answer("📎 Для завершения этой задачи прикрепите файл.")
+            await state.update_data(tid=tid)
+            await callback.message.answer("📎 Пришлите файл (фото/док) для завершения.")
             await state.set_state(TaskCompletion.waiting_for_file)
         else:
             task.status = "done"
             await session.commit()
             await callback.message.edit_text(f"✅ Задача '{task.title}' выполнена!")
             if task.created_by:
-                try:
-                    await bot.send_message(task.created_by, f"✅ Задача '{task.title}' выполнена.")
+                try: await bot.send_message(task.created_by, f"✅ Задача '{task.title}' закрыта.")
                 except: pass
 
 @dp.message(TaskCompletion.waiting_for_file, F.document | F.photo)
-async def process_file_upload(message: types.Message, state: FSMContext):
+async def task_file_upload(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    task_id = data['task_id']
     
+    # Эмуляция загрузки
     file_id = message.document.file_id if message.document else message.photo[-1].file_id
     
     async with AsyncSessionLocal() as session:
-        task = await session.get(Task, task_id)
+        task = await session.get(Task, data['tid'])
         task.status = "done"
-        task.file_url = f"file_id:{file_id}" 
+        task.file_url = f"tg_file:{file_id}"
         await session.commit()
         
-        await message.answer("✅ Файл получен, задача закрыта!")
+        await message.answer("✅ Файл принят, задача закрыта!")
         if task.created_by:
-            try:
-                 await bot.send_message(task.created_by, f"✅📎 Задача '{task.title}' выполнена, файл загружен.")
-            except: pass
-    
+             try: await bot.send_message(task.created_by, f"✅📎 Задача '{task.title}' закрыта (файл приложен).")
+             except: pass
     await state.clear()
 
-# --- ОНБОРДИНГ (A&R) ---
-
-@dp.message(F.text == "🎤 Новый артист")
-async def new_artist(message: types.Message, state: FSMContext):
-    await message.answer("Введите имя артиста:")
-    await state.set_state(NewArtist.waiting_for_name)
-
-@dp.message(NewArtist.waiting_for_name)
-async def new_artist_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Дата первого релиза (если известна, или 01.01.2026):")
-    await state.set_state(NewArtist.waiting_for_release_date)
-
-@dp.message(NewArtist.waiting_for_release_date)
-async def new_artist_finish(message: types.Message, state: FSMContext):
-    try:
-        date = datetime.strptime(message.text, "%d.%m.%Y")
-    except:
-        date = None
-    
-    data = await state.get_data()
-    async with AsyncSessionLocal() as session:
-        artist = Artist(name=data['name'], manager_id=message.from_user.id, first_release_date=date)
-        session.add(artist)
-        await session.commit()
-    
-    await message.answer(f"Артист {data['name']} добавлен.")
-    await state.clear()
-
+# --- HANDLERS: ONBOARDING CALLBACKS ---
 @dp.callback_query(F.data.startswith("onb_"))
-async def onboarding_response(callback: types.CallbackQuery):
+async def onb_callback(callback: types.CallbackQuery):
+    # Format: onb_TYPE_ANSWER_ARTID
     parts = callback.data.split("_")
-    action = parts[1]
-    answer = parts[2]
-    artist_id = int(parts[3])
+    otype, ans, aid = parts[1], parts[2], int(parts[3])
     
-    if answer == "no":
+    if ans == "no":
         await callback.message.edit_text("Понял, напомню позже.")
         return
-
+    
     async with AsyncSessionLocal() as session:
-        artist = await session.get(Artist, artist_id)
-        if not artist:
-            return
+        art = await session.get(Artist, aid)
+        if not art: return
 
         msg = "OK"
-        if action == "contract":
-            artist.contract_signed = True
-            msg = "Договор отмечен как подписанный."
-        elif action == "musixcreate":
-            artist.musixmatch_created = True
-            msg = "Профиль Musixmatch создан."
+        if otype == "contract":
+            art.contract_signed = True
+            msg = "Контракт подписан!"
+        elif otype == "musix":
+            art.musixmatch_created = True
+            msg = "Musixmatch создан!"
         
         await session.commit()
         await callback.message.edit_text(f"✅ {msg}")
 
-# --- ПЛАНИРОВЩИК ---
-
+# --- SCHEDULER ---
 async def check_overdue_tasks():
     async with AsyncSessionLocal() as session:
         now = datetime.now()
-        stmt = select(Task).where(Task.deadline < now, Task.status.in_(['pending', 'in_progress']))
-        result = await session.execute(stmt)
-        overdue_tasks = result.scalars().all()
-        
-        for task in overdue_tasks:
-            task.status = "overdue"
-            try:
-                await bot.send_message(task.assigned_to, f"⚠️ <b>ПРОСРОЧЕНО!</b>\nЗадача: {task.title}")
+        tasks = (await session.execute(select(Task).where(Task.deadline < now, Task.status.in_(['pending', 'in_progress'])))).scalars().all()
+        for t in tasks:
+            t.status = "overdue"
+            try: await bot.send_message(t.assigned_to, f"⚠️ ПРОСРОЧЕНО: {t.title}")
             except: pass
-        
         await session.commit()
-
-async def check_deadlines_approaching():
-    async with AsyncSessionLocal() as session:
-        now = datetime.now()
-        tomorrow = now + timedelta(hours=24)
-        stmt = select(Task).where(Task.deadline > now, Task.deadline <= tomorrow, Task.status != 'done')
-        result = await session.execute(stmt)
-        tasks = result.scalars().all()
-        
-        for task in tasks:
-            try:
-                await bot.send_message(task.assigned_to, f"⏰ <b>Скоро дедлайн!</b>\nЗадача: {task.title}")
-            except: pass
 
 async def onboarding_audit():
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Artist))
-        artists = result.scalars().all()
-        
-        for art in artists:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Да", callback_data=f"onb_contract_yes_{art.id}"),
-                 InlineKeyboardButton(text="Нет", callback_data=f"onb_contract_no_{art.id}")]
-            ])
-            
-            if not art.contract_signed:
-                try:
-                    await bot.send_message(art.manager_id, f"📝 <b>Онбординг {art.name}</b>\nПодписан ли договор?", reply_markup=kb, parse_mode="HTML")
+        artists = (await session.execute(select(Artist))).scalars().all()
+        for a in artists:
+            if not a.contract_signed:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Да", callback_data=f"onb_contract_yes_{a.id}"),
+                     InlineKeyboardButton(text="Нет", callback_data=f"onb_contract_no_{a.id}")]
+                ])
+                try: await bot.send_message(a.manager_id, f"📝 {a.name}: Контракт подписан?", reply_markup=kb)
                 except: pass
 
 async def critical_pitching_check():
     async with AsyncSessionLocal() as session:
-        target_date = datetime.now().date() + timedelta(days=3)
-        stmt = select(Release).where(func.date(Release.release_date) == target_date)
-        releases = (await session.execute(stmt)).scalars().all()
+        target = datetime.now().date() + timedelta(days=3)
+        # Сравниваем только дату через Python (для совместимости с разными БД)
+        # Загружаем все активные задачи по питчингу
+        tasks = (await session.execute(select(Task).where(Task.title.ilike("%питчинг%"), Task.status != "done"))).scalars().all()
         
-        for rel in releases:
-            pitch_task = (await session.execute(select(Task).where(
-                Task.release_id == rel.id, 
-                Task.title.like("%Питчинг%"),
-                Task.status != 'done'
-            ))).scalars().first()
-            
-            if pitch_task:
-                msg = f"🔥 <b>СРОЧНО! ПИТЧИНГ НЕ ГОТОВ!</b>\nРелиз: {rel.title}"
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, msg, parse_mode="HTML")
+        for t in tasks:
+            if t.deadline and t.deadline.date() == target:
+                for adm in ADMIN_IDS:
+                    try: await bot.send_message(adm, f"🔥 АЛЕРТ: Питчинг '{t.title}' горит!")
                     except: pass
 
 # --- MAIN ---
-
 async def main():
-    # Создаем таблицы в Postgres (если их нет)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
+    
     scheduler.add_job(check_overdue_tasks, 'interval', hours=1)
-    scheduler.add_job(check_deadlines_approaching, 'interval', hours=6)
-    scheduler.add_job(onboarding_audit, 'cron', hour=15, minute=0)
-    scheduler.add_job(critical_pitching_check, 'cron', hour=11, minute=0)
+    scheduler.add_job(onboarding_audit, 'interval', hours=24) # В реале 'cron'
+    scheduler.add_job(critical_pitching_check, 'interval', hours=12)
     scheduler.start()
-
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped!")
+    asyncio.run(main())
