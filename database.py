@@ -11,7 +11,18 @@ from dotenv import load_dotenv
 # Загружаем переменные окружения
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --- ИСПРАВЛЕНИЕ ВАШЕЙ ОШИБКИ ЗДЕСЬ ---
+raw_url = os.getenv("DATABASE_URL")
+
+if not raw_url:
+    raise ValueError("DATABASE_URL env variable is missing!")
+
+# Автоматически заменяем протокол на асинхронный, если указан обычный
+if raw_url.startswith("postgresql://"):
+    DATABASE_URL = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    DATABASE_URL = raw_url
+# ---------------------------------------
 
 # Создаем движок и сессию
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -43,12 +54,10 @@ class ReleaseType(str, Enum):
 class User(Base):
     __tablename__ = "users"
     
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # Telegram ID
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=True)
     full_name: Mapped[str] = mapped_column(String)
-    role: Mapped[str] = mapped_column(String)  # Храним строкой из Enum
-    
-    # Вот эта колонка, которой не хватало
+    role: Mapped[str] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 class Artist(Base):
@@ -86,15 +95,15 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String, default=TaskStatus.PENDING)
     deadline: Mapped[datetime] = mapped_column(DateTime)
     
-    assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id")) # Исполнитель
-    creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))  # Создатель
+    assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     release_id: Mapped[int] = mapped_column(ForeignKey("releases.id"), nullable=True)
     parent_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=True)
     
     needs_file: Mapped[bool] = mapped_column(Boolean, default=False)
     file_url: Mapped[str] = mapped_column(String, nullable=True)
     
-    is_regular: Mapped[bool] = mapped_column(Boolean, default=False) # Для SMM
+    is_regular: Mapped[bool] = mapped_column(Boolean, default=False)
 
 class Report(Base):
     __tablename__ = "reports"
