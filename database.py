@@ -47,7 +47,7 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=True)
-    full_name: Mapped[str] = mapped_column(String)
+    full_name: Mapped[str] = mapped_column(String, default="Неизвестный")
     role: Mapped[str] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -68,12 +68,12 @@ class Release(Base):
     __tablename__ = "releases"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
+    feat_artists: Mapped[str] = mapped_column(String, nullable=True) # Новое поле из ТЗ
     release_type: Mapped[str] = mapped_column(String)
     artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"))
     release_date: Mapped[datetime] = mapped_column(DateTime)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
-    # Связь для каскадного удаления задач при удалении релиза
     tasks: Mapped[List["Task"]] = relationship("Task", back_populates="release", cascade="all, delete-orphan")
 
 class Task(Base):
@@ -87,9 +87,10 @@ class Task(Base):
     assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
-    # Каскадное удаление
     release_id: Mapped[Optional[int]] = mapped_column(ForeignKey("releases.id", ondelete="CASCADE"), nullable=True)
     release: Mapped[Optional["Release"]] = relationship("Release", back_populates="tasks")
+    
+    parent_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=True) # Иерархия
     
     needs_file: Mapped[bool] = mapped_column(Boolean, default=False)
     file_url: Mapped[str] = mapped_column(String, nullable=True)
