@@ -20,4 +20,4 @@ COPY . .
 RUN mkdir -p /app/data
 
 # Команда запуска
-CMD ["python", "bot.py"]
+CMD ["sleep", "infinity"]
