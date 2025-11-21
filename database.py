@@ -3,16 +3,16 @@ from enum import Enum
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import Integer, String, DateTime, ForeignKey, Boolean, BigInteger, Text, func
+from sqlalchemy import Integer, String, DateTime, ForeignKey, Boolean, BigInteger, Text, func, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Логика исправления ссылки для Dokploy/Docker
+# Авто-фикс ссылки для асинхронного движка
 raw_url = os.getenv("DATABASE_URL", "")
-if raw_url.startswith("postgresql://"):
+if raw_url and raw_url.startswith("postgresql://"):
     DATABASE_URL = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 else:
     DATABASE_URL = raw_url
@@ -46,8 +46,8 @@ class ReleaseType(str, Enum):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    username: Mapped[str] = mapped_column(String, nullable=True)
     full_name: Mapped[str] = mapped_column(String, default="Неизвестный")
+    username: Mapped[str] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -68,7 +68,7 @@ class Release(Base):
     __tablename__ = "releases"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String)
-    feat_artists: Mapped[str] = mapped_column(String, nullable=True) # Новое поле из ТЗ
+    feat_artists: Mapped[str] = mapped_column(String, nullable=True)
     release_type: Mapped[str] = mapped_column(String)
     artist_id: Mapped[int] = mapped_column(ForeignKey("artists.id"))
     release_date: Mapped[datetime] = mapped_column(DateTime)
@@ -87,13 +87,19 @@ class Task(Base):
     assignee_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     
+    # Привязка к релизу с каскадным удалением
     release_id: Mapped[Optional[int]] = mapped_column(ForeignKey("releases.id", ondelete="CASCADE"), nullable=True)
     release: Mapped[Optional["Release"]] = relationship("Release", back_populates="tasks")
     
-    parent_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=True) # Иерархия
+    # Иерархия задач (родитель-ребенок)
+    parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
     
     needs_file: Mapped[bool] = mapped_column(Boolean, default=False)
     file_url: Mapped[str] = mapped_column(String, nullable=True)
+    
+    # Вот та самая колонка, из-за которой была ошибка.
+    # server_default гарантирует, что на уровне БД она не будет NULL
+    is_regular: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text('false'))
 
 class Report(Base):
     __tablename__ = "reports"
@@ -101,3 +107,15 @@ class Report(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+# --- АВТО-ЧИСТКА (Fixer) ---
+async def init_db_and_clean():
+    """
+    Эта функция полностью пересоздаст таблицы при старте.
+    Это решит все проблемы с IntegrityError и отсутствующими колонками.
+    """
+    async with engine.begin() as conn:
+        # Удаляем всё старое
+        await conn.run_sync(Base.metadata.drop_all)
+        # Создаем всё новое и правильное
+        await conn.run_sync(Base.metadata.create_all)
