@@ -2,11 +2,11 @@ import asyncio
 import logging
 import datetime
 import os
-import requests
 import sys
 import psycopg2
+import aiohttp
 from psycopg2.extras import DictCursor
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
@@ -21,19 +21,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ==============================================================================
-# 0. КОНФИГУРАЦИЯ
+# 0. КОНФИГУРАЦИЯ И ЛОГГИРОВАНИЕ
 # ==============================================================================
 
 API_TOKEN = os.getenv('API_TOKEN')
 
-# Парсим ID админов из строки "123,456" в список чисел
+# Парсим ID админов
 admin_ids_str = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(x) for x in admin_ids_str.split(',')] if admin_ids_str else []
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 YANDEX_DISK_TOKEN = os.getenv('YANDEX_DISK_TOKEN')
-YANDEX_API_URL = "https://cloud-api.yandex.net/v1/disk/resources"
 YANDEX_UPLOAD_FOLDER = "label_bot_files"
 
 logging.basicConfig(
@@ -56,45 +55,69 @@ ROLES_MAP = {
 ROLES_DISPLAY = {v: k for k, v in ROLES_MAP.items()}
 
 # ==============================================================================
-# 1. YANDEX DISK
+# 1. СЕРВИС YANDEX DISK (ASYNC)
 # ==============================================================================
-class YandexDiskService:
+class AsyncYandexDisk:
     def __init__(self, token, folder_name):
         self.token = token
         self.headers = {"Authorization": f"OAuth {token}"}
         self.folder_name = folder_name
-        self._ensure_folder_exists()
+        self.api_url = "https://cloud-api.yandex.net/v1/disk/resources"
 
-    def _ensure_folder_exists(self):
-        url = f"{YANDEX_API_URL}?path={self.folder_name}"
-        try: requests.put(url, headers=self.headers)
-        except: pass
+    async def _ensure_folder(self, session):
+        url = f"{self.api_url}?path={self.folder_name}"
+        async with session.put(url, headers=self.headers) as resp:
+            pass # Игнорируем ошибку, если папка уже есть
 
-    def upload_and_publish(self, file_bytes, file_name):
-        try:
-            full_path = f"{self.folder_name}/{file_name}"
-            upload_req_url = f"{YANDEX_API_URL}/upload?path={full_path}&overwrite=true"
-            res_url = requests.get(upload_req_url, headers=self.headers)
-            if res_url.status_code != 200: return None
-            
-            upload_link = res_url.json().get('href')
-            res_upload = requests.put(upload_link, files={'file': file_bytes})
-            if res_upload.status_code != 201: return None
-            
-            requests.put(f"{YANDEX_API_URL}/publish?path={full_path}", headers=self.headers)
-            res_meta = requests.get(f"{YANDEX_API_URL}?path={full_path}", headers=self.headers)
-            
-            if res_meta.status_code == 200:
-                return res_meta.json().get('public_url')
-            return None
-        except Exception as e:
-            logger.error(f"YD Error: {e}")
-            return None
+    async def upload_file(self, file_bytes, file_name):
+        """
+        Асинхронная загрузка файла.
+        file_bytes: байты файла или поток (BytesIO)
+        file_name: имя файла для сохранения
+        """
+        async with aiohttp.ClientSession() as session:
+            try:
+                # 1. Убедимся, что папка существует
+                await self._ensure_folder(session)
 
-ydisk = YandexDiskService(YANDEX_DISK_TOKEN, YANDEX_UPLOAD_FOLDER)
+                full_path = f"{self.folder_name}/{file_name}"
+                
+                # 2. Получаем ссылку для загрузки (GET request)
+                upload_req_url = f"{self.api_url}/upload"
+                params = {"path": full_path, "overwrite": "true"}
+                
+                async with session.get(upload_req_url, headers=self.headers, params=params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"YD Get Link Error: {await resp.text()}")
+                        return None
+                    data = await resp.json()
+                    upload_link = data.get('href')
+
+                # 3. Загружаем сам файл (PUT request)
+                async with session.put(upload_link, data=file_bytes) as upload_resp:
+                    if upload_resp.status != 201:
+                        logger.error(f"YD Upload Error: {upload_resp.status}")
+                        return None
+
+                # 4. Публикуем (делаем файл доступным)
+                publish_url = f"{self.api_url}/publish"
+                async with session.put(publish_url, headers=self.headers, params={"path": full_path}) as pub_resp:
+                    pass 
+
+                # 5. Получаем публичную ссылку
+                async with session.get(self.api_url, headers=self.headers, params={"path": full_path}) as meta_resp:
+                    if meta_resp.status == 200:
+                        meta = await meta_resp.json()
+                        return meta.get('public_url')
+                    return None
+            except Exception as e:
+                logger.error(f"YD Exception: {e}")
+                return None
+
+ydisk = AsyncYandexDisk(YANDEX_DISK_TOKEN, YANDEX_UPLOAD_FOLDER)
 
 # ==============================================================================
-# 2. POSTGRESQL DATABASE
+# 2. БАЗА ДАННЫХ (POSTGRESQL)
 # ==============================================================================
 class Database:
     def __init__(self, dsn):
@@ -112,9 +135,16 @@ class Database:
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id BIGINT PRIMARY KEY,
                     name TEXT,
+                    username TEXT,
                     role TEXT
                 )
             """)
+            # Добавляем колонку username, если её нет (миграция для старой базы)
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
+            except: 
+                pass
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS artists (
                     id SERIAL PRIMARY KEY,
@@ -167,19 +197,20 @@ class Database:
     def _seed_admins(self):
         for uid in ADMIN_IDS:
             if not self.get_user(uid):
-                self.add_user(uid, "Founder", "founder")
+                # username не знаем, ставим None
+                self.add_user(uid, "Founder", "founder", None)
 
     def get_user(self, uid):
         with self.get_cursor() as cur:
             cur.execute("SELECT * FROM users WHERE telegram_id=%s", (uid,))
             return cur.fetchone()
     
-    def add_user(self, uid, name, role):
+    def add_user(self, uid, name, role, username=None):
         with self.get_cursor() as cur:
             cur.execute("""
-                INSERT INTO users (telegram_id, name, role) VALUES (%s, %s, %s)
-                ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role
-            """, (uid, name, role))
+                INSERT INTO users (telegram_id, name, role, username) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, username = EXCLUDED.username
+            """, (uid, name, role, username))
 
     def delete_user(self, uid):
         with self.get_cursor() as cur:
@@ -201,7 +232,10 @@ class Database:
 
     def get_user_link(self, uid):
         u = self.get_user(uid)
-        if u: return f"<a href='tg://user?id={uid}'>{u['name']}</a>"
+        if u: 
+            if u.get('username'):
+                return f"<a href='tg://user?id={uid}'>{u['name']}</a> (@{u['username']})"
+            return f"<a href='tg://user?id={uid}'>{u['name']}</a>"
         return f"ID:{uid}"
     
     def create_task(self, title, desc, assigned, created, rel_id, deadline, req_file=0, parent_id=None):
@@ -233,6 +267,31 @@ class Database:
             else:
                 cur.execute("UPDATE tasks SET status=%s WHERE id=%s", (status, tid))
 
+    # --- PAGING SUPPORT ---
+    def get_releases_paginated(self, user_role, user_id, page=0, limit=5):
+        offset = page * limit
+        with self.get_cursor() as cur:
+            if user_role == 'founder':
+                # Считаем общее кол-во
+                cur.execute("SELECT COUNT(*) FROM releases")
+                total = cur.fetchone()[0]
+                
+                cur.execute("""
+                    SELECT r.*, u.name as creator_name FROM releases r
+                    LEFT JOIN users u ON r.created_by = u.telegram_id
+                    ORDER BY r.release_date DESC LIMIT %s OFFSET %s
+                """, (limit, offset))
+            else:
+                cur.execute("SELECT COUNT(*) FROM releases WHERE created_by = %s", (user_id,))
+                total = cur.fetchone()[0]
+                
+                cur.execute("""
+                    SELECT * FROM releases WHERE created_by = %s 
+                    ORDER BY release_date DESC LIMIT %s OFFSET %s
+                """, (user_id, limit, offset))
+            
+            return cur.fetchall(), total
+
 db = Database(DATABASE_URL)
 
 # ==============================================================================
@@ -247,7 +306,8 @@ class SMMReportState(StatesGroup): text=State()
 # ==============================================================================
 # 4. UTILS
 # ==============================================================================
-def get_cancel_kb(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Отмена")]], resize_keyboard=True)
+def get_cancel_kb(): 
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔙 Отмена")]], resize_keyboard=True)
 
 def get_main_kb(role):
     kb = []
@@ -273,18 +333,20 @@ def get_main_kb(role):
 
 async def notify_user(uid, text, reply_markup=None):
     try: await bot.send_message(uid, text, reply_markup=reply_markup, parse_mode="HTML")
-    except: pass
+    except Exception as e: logger.warning(f"Failed to notify {uid}: {e}")
 
 # ==============================================================================
 # 5. HANDLERS
 # ==============================================================================
+
+# --- MIDDLEWARES ---
 @dp.message.outer_middleware
 async def auth_middleware(handler, event: types.Message, data):
     if event.text == "/start": return await handler(event, data)
     if event.from_user:
         user = db.get_user(event.from_user.id)
         if not user:
-            await event.answer("⛔️ <b>Доступ запрещен.</b>", parse_mode="HTML")
+            await event.answer("⛔️ <b>Доступ запрещен.</b>\nОбратитесь к администратору.", parse_mode="HTML")
             return
     return await handler(event, data)
 
@@ -296,6 +358,7 @@ async def auth_middleware_callbacks(handler, event: types.CallbackQuery, data):
             return
     return await handler(event, data)
 
+# --- START & COMMON ---
 @dp.message(F.text == "🔙 Отмена")
 async def cancel_handler(m: types.Message, state: FSMContext):
     await state.clear()
@@ -305,7 +368,12 @@ async def cancel_handler(m: types.Message, state: FSMContext):
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message):
     user = db.get_user(m.from_user.id)
-    if not user: return await m.answer("⛔️ Вас нет в системе.")
+    if not user: return await m.answer("⛔️ Вас нет в системе. Попросите администратора добавить ваш ID.")
+    
+    # Обновляем username если он изменился или не был задан
+    if m.from_user.username:
+        db.add_user(m.from_user.id, user['name'], user['role'], m.from_user.username)
+
     role_name = ROLES_DISPLAY.get(user['role'], user['role'])
     await m.answer(f"👋 Привет, <b>{user['name']}</b>!\nРоль: <code>{role_name}</code>", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
 
@@ -317,7 +385,8 @@ async def list_users(m: types.Message):
     text = "👥 <b>Команда лейбла:</b>\n\n"
     for u in users:
         role_nice = ROLES_DISPLAY.get(u['role'], u['role'])
-        text += f"🔹 <a href='tg://user?id={u['telegram_id']}'>{u['name']}</a> — <code>{role_nice}</code>\n"
+        un = f"(@{u['username']})" if u.get('username') else ""
+        text += f"🔹 <a href='tg://user?id={u['telegram_id']}'>{u['name']}</a> {un} — <code>{role_nice}</code>\n"
     await m.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "➕ Добавить юзера")
@@ -349,9 +418,10 @@ async def add_user_finish(m: types.Message, state: FSMContext):
     role_code = ROLES_MAP.get(m.text)
     if not role_code: return await m.answer("⚠️ Выберите роль кнопкой.")
     data = await state.get_data()
+    # username пока Null, обновится при первом /start сотрудника
     db.add_user(int(data['uid']), data['name'], role_code)
     await m.answer(f"✅ <b>{data['name']}</b> добавлен!", reply_markup=get_main_kb('founder'), parse_mode="HTML")
-    await notify_user(int(data['uid']), f"🎉 <b>Добро пожаловать!</b>\nРоль: {m.text}\nНажмите /start")
+    await notify_user(int(data['uid']), f"🎉 <b>Добро пожаловать!</b>\nРоль: {m.text}\nНажмите /start для начала работы.")
     await state.clear()
 
 @dp.message(F.text == "🗑 Удалить юзера")
@@ -417,6 +487,7 @@ async def create_release_finish(m: types.Message, state: FSMContext):
     manager_id = m.from_user.id
     
     with db.get_cursor() as cur:
+        # Проверяем или создаем артиста
         cur.execute("SELECT id FROM artists WHERE name=%s", (data['artist'],))
         artist = cur.fetchone()
         if not artist:
@@ -425,6 +496,7 @@ async def create_release_finish(m: types.Message, state: FSMContext):
             artist_id = cur.fetchone()[0]
         else: artist_id = artist['id']
         
+        # Создаем релиз
         cur.execute("INSERT INTO releases (title, artist_id, type, release_date, created_by) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (data['title'], artist_id, data['type'], clean_date, manager_id))
         rel_id = cur.fetchone()[0]
@@ -434,6 +506,7 @@ async def create_release_finish(m: types.Message, state: FSMContext):
     await state.clear()
 
 async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name, need_cover):
+    # Поиск дизайнера
     with db.get_cursor() as cur:
         cur.execute("SELECT telegram_id FROM users WHERE role='designer'")
         designer = cur.fetchone()
@@ -456,44 +529,66 @@ async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name,
         dl = (r_dt - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
         db.create_task(f"{t_name} | {artist_name}", t_desc, assignee, manager_id, rel_id, dl, req)
 
+# --- RELEASES LIST (PAGINATION) ---
 @dp.message(F.text.in_({"💿 Релизы", "💿 Все релизы", "💿 Мои релизы"}))
-async def list_releases(m: types.Message):
-    uid = m.from_user.id
+async def list_releases_handler(m: types.Message):
+    await show_releases_page(m, 0)
+
+async def show_releases_page(message_or_call, page):
+    # Определяем ID пользователя и метод ответа
+    if isinstance(message_or_call, types.Message):
+        uid = message_or_call.from_user.id
+        reply_func = message_or_call.answer
+    else:
+        uid = message_or_call.from_user.id
+        reply_func = message_or_call.message.edit_text
+
     user = db.get_user(uid)
     if user['role'] not in ['founder', 'anr']: return
 
-    with db.get_cursor() as cur:
-        if user['role'] == 'founder':
-            cur.execute("""
-                SELECT r.*, u.name as creator_name FROM releases r
-                LEFT JOIN users u ON r.created_by = u.telegram_id
-                ORDER BY r.release_date DESC LIMIT 20
-            """)
-            rels = cur.fetchall()
-            header = "💿 <b>Все релизы лейбла:</b>\n\n"
-        else:
-            cur.execute("SELECT * FROM releases WHERE created_by = %s ORDER BY release_date DESC LIMIT 20", (uid,))
-            rels = cur.fetchall()
-            header = "💿 <b>Ваши релизы:</b>\n\n"
+    rels, total_count = db.get_releases_paginated(user['role'], uid, page=page, limit=5)
     
-    if not rels: return await m.answer("📭 Список пуст.")
+    header = "💿 <b>Все релизы:</b>" if user['role'] == 'founder' else "💿 <b>Ваши релизы:</b>"
     
-    text = header
-    for r in rels:
-        c_info = f"👤 От: {r['creator_name']}\n" if user['role'] == 'founder' and 'creator_name' in r else ""
-        text += f"🎶 <b>{r['title']}</b> ({r['type']})\n📅 {r['release_date']}\n{c_info}🆔 ID: <code>{r['id']}</code>\n➖➖➖➖➖➖\n"
-    await m.answer(text, parse_mode="HTML")
+    if not rels:
+        text = f"{header}\n📭 Список пуст."
+        kb = None
+    else:
+        text = f"{header} (Всего: {total_count})\n\n"
+        for r in rels:
+            c_info = f"👤 От: {r['creator_name']}\n" if user['role'] == 'founder' and 'creator_name' in r else ""
+            text += f"🎶 <b>{r['title']}</b> ({r['type']})\n📅 {r['release_date']}\n{c_info}🆔 ID: <code>{r['id']}</code>\n➖➖➖➖➖➖\n"
+        
+        # Кнопки пагинации
+        kb_build = InlineKeyboardBuilder()
+        if page > 0:
+            kb_build.button(text="⬅️ Назад", callback_data=f"relpage_{page-1}")
+        
+        if (page + 1) * 5 < total_count:
+            kb_build.button(text="Вперед ➡️", callback_data=f"relpage_{page+1}")
+        
+        kb = kb_build.as_markup()
+
+    if isinstance(message_or_call, types.CallbackQuery):
+        await reply_func(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await reply_func(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("relpage_"))
+async def releases_page_callback(c: CallbackQuery):
+    page = int(c.data.split("_")[1])
+    await show_releases_page(c, page)
 
 @dp.message(F.text == "🗑 Удалить релиз")
 async def delete_rel_start(m: types.Message):
     if db.get_user(m.from_user.id)['role'] != 'founder': return
     with db.get_cursor() as cur:
-        cur.execute("SELECT * FROM releases ORDER BY release_date DESC")
+        cur.execute("SELECT * FROM releases ORDER BY release_date DESC LIMIT 10") # Only last 10 for simplicity in deletion
         rels = cur.fetchall()
     kb = InlineKeyboardBuilder()
     for r in rels: kb.button(text=f"❌ {r['title']}", callback_data=f"del_rel_{r['id']}")
     kb.adjust(1)
-    await m.answer("Выберите релиз для удаления:", reply_markup=kb.as_markup())
+    await m.answer("Выберите релиз для удаления (показаны последние 10):", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("del_rel_"))
 async def delete_rel_confirm(c: CallbackQuery):
@@ -520,6 +615,7 @@ async def manual_task_assign(m: types.Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
     for u in users: 
         r = ROLES_DISPLAY.get(u['role'], u['role'])
+        # Добавляем имя и роль
         kb.button(text=f"{u['name']} ({r})", callback_data=f"assign_{u['telegram_id']}")
     kb.adjust(2)
     await m.answer("👤 <b>Исполнитель:</b>", reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -548,7 +644,9 @@ async def manual_task_fin(m: types.Message, state: FSMContext):
     req = 1 if m.text == "Да" else 0
     d = await state.get_data()
     db.create_task(d['title'], d['desc'], d['assignee'], m.from_user.id, None, d['deadline'], req)
-    msg = f"🔔 <b>НОВАЯ ЗАДАЧА</b>\n📌 {d['title']}\n📄 {d['desc']}\n🗓 {d['deadline']}"
+    
+    creator_link = db.get_user_link(m.from_user.id)
+    msg = f"🔔 <b>НОВАЯ ЗАДАЧА</b>\n📌 {d['title']}\n📄 {d['desc']}\n🗓 {d['deadline']}\n👤 От: {creator_link}"
     await notify_user(d['assignee'], msg)
     await m.answer("✅ Задача назначена!", reply_markup=get_main_kb(db.get_user(m.from_user.id)['role']))
     await state.clear()
@@ -633,7 +731,7 @@ async def history(m: types.Message):
     with db.get_cursor() as cur:
         if role == 'founder':
             cur.execute("SELECT * FROM tasks WHERE status='done' ORDER BY deadline DESC LIMIT 20")
-            header = "📜 <b>Глобальная история:</b>"
+            header = "📜 <b>Глобальная история (последние 20):</b>"
         else:
             cur.execute("SELECT * FROM tasks WHERE status='done' AND assigned_to=%s ORDER BY deadline DESC LIMIT 20", (uid,))
             header = "📜 <b>Ваша история:</b>"
@@ -649,7 +747,7 @@ async def history(m: types.Message):
         txt += "━━━━━━━━━━━━━━━━\n"
     await m.answer(txt, parse_mode="HTML", disable_web_page_preview=True)
 
-# --- FINISH ---
+# --- FINISH & UPLOAD (UPDATED ASYNC) ---
 @dp.callback_query(F.data.startswith("fin_"))
 async def fin_start(c: CallbackQuery, state: FSMContext):
     tid = int(c.data.split("_")[1])
@@ -667,28 +765,48 @@ async def fin_start(c: CallbackQuery, state: FSMContext):
 @dp.message(FinishTask.file)
 async def fin_file(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
-    if not (m.document or m.photo): return await m.answer("📎 Жду файл.")
+    if not (m.document or m.photo): return await m.answer("📎 Жду файл (Документ или Фото).")
     
-    msg = await m.answer("⏳ Загрузка...")
-    if m.document: fid, fname, ftype = m.document.file_id, m.document.file_name, "doc"
-    else: fid, fname, ftype = m.photo[-1].file_id, f"photo_{m.photo[-1].file_id}.jpg", "photo"
+    msg = await m.answer("⏳ Загрузка... (0%)")
+    
+    # Определяем ID и имя файла
+    if m.document: 
+        fid = m.document.file_id
+        fname = m.document.file_name or f"file_{fid}"
+        ftype = "doc"
+    else: 
+        fid = m.photo[-1].file_id
+        fname = f"photo_{fid}.jpg"
+        ftype = "photo"
 
     pub_url = None
     try:
         f_info = await bot.get_file(fid)
-        if f_info.file_size < 20*1024*1024:
-            f_data = await bot.download_file(f_info.file_path)
-            pub_url = ydisk.upload_and_publish(f_data, fname)
-    except: pass
+        # Если файл меньше 200МБ (лимит бота), пробуем грузить
+        # ВНИМАНИЕ: Для очень больших файлов нужен Local Bot API, но для облака пойдет
+        
+        # Скачиваем файл в поток (BytesIO)
+        import io
+        file_stream = io.BytesIO()
+        await bot.download_file(f_info.file_path, destination=file_stream)
+        file_stream.seek(0) # Сброс указателя в начало
+
+        await msg.edit_text("⏳ Загрузка... (Отправка на Яндекс)")
+        # Асинхронная загрузка
+        pub_url = await ydisk.upload_file(file_stream, fname)
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        await msg.edit_text(f"⚠️ Ошибка загрузки: {e}")
 
     if pub_url:
-        await msg.edit_text("✅ На Диске!")
+        await msg.edit_text("✅ Загружено на Диск!")
         await state.update_data(f_val=pub_url)
     else:
-        await msg.edit_text("⚠️ Сохранено в Telegram.")
+        await msg.edit_text("⚠️ Не удалось загрузить на Диск. Сохранена ссылка на TG.")
         await state.update_data(f_val=f"tg:{ftype}:{fid}")
     
-    await m.answer("💬 Комментарий:", reply_markup=get_cancel_kb())
+    await m.answer("💬 Комментарий к задаче:", reply_markup=get_cancel_kb())
     await state.set_state(FinishTask.comment)
 
 @dp.message(FinishTask.comment)
@@ -701,6 +819,7 @@ async def fin_commit(m: types.Message, state: FSMContext):
     txt = f"✅ <b>Выполнено!</b>\n📌 {d['title']}\n👤 {perf}\n💬 {m.text}"
     
     try:
+        # Уведомляем создателя
         if d.get('f_val') and "tg:" in d['f_val']:
             txt += "\n📎 Файл ниже"
             await notify_user(d['creator'], txt)
@@ -727,12 +846,10 @@ async def smm_start(m: types.Message, state: FSMContext):
 async def smm_save(m: types.Message, state: FSMContext):
     if m.text == "🔙 Отмена": return await cancel_handler(m, state)
     
-    # 1. Save to DB
     with db.get_cursor() as cur:
         cur.execute("INSERT INTO reports (user_id, report_date, text) VALUES (%s, %s, %s)", 
                     (m.from_user.id, datetime.date.today(), m.text))
     
-    # 2. Notify Admins (FIXED)
     reporter = db.get_user_link(m.from_user.id)
     report_msg = (
         f"📊 <b>НОВЫЙ SMM ОТЧЕТ</b>\n"
@@ -788,12 +905,14 @@ async def onb_act(c: CallbackQuery):
 async def ign(c: CallbackQuery): await c.message.delete()
 
 async def main():
-    scheduler.add_job(job_check_overdue, CronTrigger(minute=0))
-    scheduler.add_job(job_deadline_alerts, CronTrigger(hour='0,6,12,18'))
+    # Запускаем задачи
+    scheduler.add_job(job_check_overdue, CronTrigger(minute=0)) # Раз в час проверять просрочку
+    scheduler.add_job(job_deadline_alerts, CronTrigger(hour='10,18')) # Уведомления утром и вечером
     scheduler.add_job(job_onboarding, CronTrigger(hour=15))
     scheduler.start()
+    
     await bot.delete_webhook(drop_pending_updates=True)
-    print("BOT STARTED (POSTGRESQL VERSION)")
+    print("BOT STARTED (ASYNC V2)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
