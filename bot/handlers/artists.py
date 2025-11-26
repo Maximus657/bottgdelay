@@ -85,9 +85,8 @@ async def add_artist_finish(m: types.Message, state: FSMContext):
     await m.answer(f"✅ Артист <b>{data['name']}</b> добавлен!", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
     await state.clear()
 
-@router.callback_query(F.data.startswith("view_art_"))
-async def view_artist(c: CallbackQuery):
-    aid = int(c.data.split("_")[2])
+async def render_artist_view(c: CallbackQuery, aid: int):
+    """Отображает карточку артиста."""
     artist = await db.get_artist_by_id(aid)
     if not artist: return await c.answer("Артист не найден")
     
@@ -115,28 +114,31 @@ async def view_artist(c: CallbackQuery):
     kb.button(text="🔙 К списку", callback_data="back_artists")
     kb.adjust(1)
     
-    await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    try:
+        await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await c.answer() # Ignore if not modified
+
+@router.callback_query(F.data.startswith("view_art_"))
+async def view_artist(c: CallbackQuery):
+    aid = int(c.data.split("_")[2])
+    await render_artist_view(c, aid)
 
 @router.callback_query(F.data.startswith("tog_"))
 async def toggle_artist_flag(c: CallbackQuery):
-    data = c.data.split("_")
-    col = f"{data[1]}_{data[2]}" # flag_contract и т.д. содержат _, поэтому split может разбить на 3+ части
-    # Мой формат: tog_{flag_col}_{aid}
-    # Пример: tog_flag_contract_1
-    # split("_"): ['tog', 'flag', 'contract', '1'] -> ОЙ!
-    
-    # Исправим парсинг
     parts = c.data.split("_")
     aid = int(parts[-1])
     col = "_".join(parts[1:-1])
     
     artist = await db.get_artist_by_id(aid)
+    if not artist: return await c.answer("Артист не найден")
+
     new_val = 0 if artist[col] else 1
     
     await db.update_artist_flag(aid, col, new_val)
     
     # Обновляем view
-    await view_artist(c)
+    await render_artist_view(c, aid)
 
 @router.callback_query(F.data == "back_artists")
 async def back_to_list(c: CallbackQuery):
