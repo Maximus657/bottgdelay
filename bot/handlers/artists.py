@@ -4,6 +4,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.config import ADMIN_IDS
+from bot.utils import notify_user
 from bot.database import db
 from bot.states import CreateArtist
 from bot.keyboards.builders import get_cancel_kb, get_main_kb
@@ -82,6 +84,23 @@ async def add_artist_finish(m: types.Message, state: FSMContext):
     await db.create_artist(data['name'], data['manager'], date_str)
     
     user = await db.get_user(m.from_user.id)
+    
+    # Уведомление фаундерам
+    creator_link = await db.get_user_link(m.from_user.id)
+    mgr_info = await db.get_user(data['manager'])
+    mgr_name = mgr_info['name'] if mgr_info else "Неизвестно"
+    
+    notify_text = (
+        f"🔔 <b>Новый артист!</b>\n\n"
+        f"🎤 Имя: {data['name']}\n"
+        f"💼 Менеджер: {mgr_name}\n"
+        f"📅 Первый релиз: {date_str or 'Не задан'}\n"
+        f"👤 Добавил: {creator_link}"
+    )
+    
+    for admin_id in ADMIN_IDS:
+        await notify_user(m.bot, admin_id, notify_text)
+
     await m.answer(f"✅ Артист <b>{data['name']}</b> добавлен!", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
     await state.clear()
 
@@ -136,6 +155,29 @@ async def toggle_artist_flag(c: CallbackQuery):
     new_val = 0 if artist[col] else 1
     
     await db.update_artist_flag(aid, col, new_val)
+    
+    # Уведомление фаундерам
+    flags_map = {
+        'flag_contract': '📝 Контракт',
+        'flag_mm_profile': '🎵 MM Профиль',
+        'flag_mm_verify': '✅ MM Верификация',
+        'flag_yt_link': '📺 YouTube Линк',
+        'flag_yt_note': '🎼 YouTube Нота'
+    }
+    flag_name = flags_map.get(col, col)
+    status_text = "✅ Включен" if new_val else "❌ Выключен"
+    user_link = await db.get_user_link(c.from_user.id)
+    
+    notify_text = (
+        f"🔔 <b>Изменение статуса артиста</b>\n\n"
+        f"🎤 Артист: {artist['name']}\n"
+        f"🔖 Флаг: {flag_name}\n"
+        f"Статус: {status_text}\n"
+        f"👤 Изменил: {user_link}"
+    )
+    
+    for admin_id in ADMIN_IDS:
+        await notify_user(c.bot, admin_id, notify_text)
     
     # Обновляем view
     await render_artist_view(c, aid)

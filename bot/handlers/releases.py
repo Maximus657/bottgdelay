@@ -4,6 +4,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.config import ADMIN_IDS
+from bot.utils import notify_user
 from bot.database import db
 from bot.states import CreateRelease
 from bot.keyboards.builders import get_cancel_kb, get_main_kb
@@ -110,6 +112,20 @@ async def create_release_finish(m: types.Message, state: FSMContext):
     await generate_release_tasks(rel_id, data['title'], clean_date, manager_id, data['artist'], data['need_cover'], data['type'])
     
     user = await db.get_user(manager_id)
+    
+    # Уведомление фаундерам
+    creator_link = await db.get_user_link(manager_id)
+    notify_text = (
+        f"🔔 <b>Новый релиз!</b>\n\n"
+        f"🎶 {data['artist']} — {data['title']}\n"
+        f"📼 Тип: {data['type']}\n"
+        f"📅 Дата: {clean_date}\n"
+        f"👤 Создал: {creator_link}"
+    )
+    
+    for admin_id in ADMIN_IDS:
+        await notify_user(m.bot, admin_id, notify_text)
+
     await m.answer(f"🚀 <b>Релиз создан!</b>\n🎶 {data['artist']} — {data['title']}", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
     await state.clear()
 
