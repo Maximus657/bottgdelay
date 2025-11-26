@@ -7,7 +7,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.database import db
 from bot.states import CreateArtist
 from bot.keyboards.builders import get_cancel_kb, get_main_kb
-from bot.utils import notify_user
 
 router = Router()
 
@@ -141,8 +140,6 @@ async def toggle_artist_flag(c: CallbackQuery):
 
 @router.callback_query(F.data == "back_artists")
 async def back_to_list(c: CallbackQuery):
-    await c.message.delete()
-    user = await db.get_user(c.from_user.id)
     artists = await db.get_all_artists()
     text = "🎤 <b>Список артистов:</b>\n\n"
     kb = InlineKeyboardBuilder()
@@ -156,4 +153,4 @@ async def back_to_list(c: CallbackQuery):
         kb.button(text=f"{a['name']} {status}", callback_data=f"view_art_{a['id']}")
     kb.button(text="➕ Добавить артиста", callback_data="add_artist")
     kb.adjust(1)
-    await c.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")

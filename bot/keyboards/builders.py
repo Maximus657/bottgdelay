@@ -1,5 +1,4 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def get_cancel_kb(): 
     """Возвращает клавиатуру с кнопкой отмены."""
@@ -26,7 +25,7 @@ def get_main_kb(role):
     elif role == 'designer':
         kb = [[KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="📜 История")], [KeyboardButton(text="🕰 Просроченные")]]
     elif role == 'smm':
-        kb = [[KeyboardButton(text="📝 Написать отчет"), KeyboardButton(text="📅 Мои отчеты")],
+        kb = [[KeyboardButton(text="📊 Отправить отчет"), KeyboardButton(text="🗂 Мои отчеты")],
               [KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="📜 История")]]
     
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)

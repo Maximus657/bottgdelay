@@ -7,7 +7,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.database import db
 from bot.states import CreateRelease
 from bot.keyboards.builders import get_cancel_kb, get_main_kb
-from bot.config import ROLES_DISPLAY
 
 router = Router()
 
@@ -53,14 +52,14 @@ async def create_release_start(m: types.Message, state: FSMContext):
     """Начало создания релиза."""
     user = await db.get_user(m.from_user.id)
     if user['role'] not in ['founder', 'anr']: return
-    await m.answer("🎤 <b>Артист(ы):</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await m.answer("🎤 <b>Введите имя артиста:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(CreateRelease.artist_str)
 
 @router.message(CreateRelease.artist_str)
 async def create_release_title(m: types.Message, state: FSMContext):
     """Ввод названия релиза."""
     await state.update_data(artist=m.text)
-    await m.answer("💿 <b>Название релиза:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await m.answer("💿 <b>Введите название релиза:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(CreateRelease.title)
 
 @router.message(CreateRelease.title)
@@ -177,11 +176,11 @@ async def delete_rel_start(m: types.Message):
     kb = InlineKeyboardBuilder()
     for r in rels: kb.button(text=f"❌ {r['title']}", callback_data=f"del_rel_{r['id']}")
     kb.adjust(1)
-    await m.answer("Выберите релиз для удаления (показаны последние 10):", reply_markup=kb.as_markup())
+    await m.answer("🗑 <b>Выберите релиз для удаления</b> (показаны последние 10):", reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("del_rel_"))
 async def delete_rel_confirm(c: CallbackQuery):
     """Подтверждение удаления релиза."""
     rid = int(c.data.split("_")[2])
     await db.delete_release_cascade(rid)
-    await c.message.edit_text("🗑 Релиз и задачи удалены.")
+    await c.message.edit_text("🗑 <b>Релиз и задачи удалены.</b>", parse_mode="HTML")

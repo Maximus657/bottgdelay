@@ -19,14 +19,14 @@ ydisk = AsyncYandexDisk(YANDEX_DISK_TOKEN, YANDEX_UPLOAD_FOLDER)
 @router.message(F.text == "➕ Создать задачу")
 async def manual_task_start(m: types.Message, state: FSMContext):
     """Начало создания задачи вручную."""
-    await m.answer("📝 <b>Заголовок задачи:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await m.answer("📝 <b>Введите заголовок задачи:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(CreateTask.title)
 
 @router.message(CreateTask.title)
 async def manual_task_desc(m: types.Message, state: FSMContext):
     """Ввод описания задачи."""
     await state.update_data(title=m.text)
-    await m.answer("📝 <b>Описание задачи:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await m.answer("📝 <b>Введите описание задачи:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(CreateTask.desc)
 
 @router.message(CreateTask.desc)
@@ -47,7 +47,7 @@ async def manual_task_assign(m: types.Message, state: FSMContext):
 async def manual_task_deadline(c: CallbackQuery, state: FSMContext):
     """Ввод дедлайна задачи."""
     await state.update_data(assignee=int(c.data.split("_")[1]))
-    await c.message.answer("📅 <b>Дедлайн (YYYY-MM-DD):</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await c.message.answer("📅 <b>Введите дедлайн (YYYY-MM-DD):</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(CreateTask.deadline)
 
 @router.message(CreateTask.deadline)
@@ -228,7 +228,7 @@ async def fin_file(m: types.Message, state: FSMContext, bot: Bot):
         await bot.download_file(f_info.file_path, destination=file_stream)
         file_stream.seek(0) # Сброс указателя в начало
 
-        await msg.edit_text("⏳ Загрузка... (Отправка на Яндекс)")
+        await msg.edit_text("⏳ <b>Загрузка...</b> (Отправка на Яндекс)", parse_mode="HTML")
         # Асинхронная загрузка
         pub_url = await ydisk.upload_file(file_stream, fname)
         
@@ -237,13 +237,13 @@ async def fin_file(m: types.Message, state: FSMContext, bot: Bot):
         await msg.edit_text(f"⚠️ Ошибка загрузки: {e}")
 
     if pub_url:
-        await msg.edit_text("✅ Загружено на Диск!")
+        await msg.edit_text("✅ <b>Загружено на Диск!</b>", parse_mode="HTML")
         await state.update_data(f_val=pub_url)
     else:
         await msg.edit_text("⚠️ Не удалось загрузить на Диск. Сохранена ссылка на TG.")
         await state.update_data(f_val=f"tg:{ftype}:{fid}")
     
-    await m.answer("💬 Комментарий к задаче:", reply_markup=get_cancel_kb())
+    await m.answer("💬 <b>Напишите комментарий к задаче:</b>", reply_markup=get_cancel_kb(), parse_mode="HTML")
     await state.set_state(FinishTask.comment)
 
 @router.message(FinishTask.comment)
@@ -277,5 +277,5 @@ async def fin_commit(m: types.Message, state: FSMContext, bot: Bot):
     except: pass
 
     user = await db.get_user(m.from_user.id)
-    await m.answer("👍 Готово.", reply_markup=get_main_kb(user['role']))
+    await m.answer("👍 <b>Задача выполнена!</b>", reply_markup=get_main_kb(user['role']), parse_mode="HTML")
     await state.clear()
