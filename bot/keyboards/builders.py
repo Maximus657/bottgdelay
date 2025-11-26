@@ -12,16 +12,16 @@ def get_main_kb(role):
     kb = []
     if role == 'founder':
         kb = [
-            [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="➕ Добавить юзера")],
-            [KeyboardButton(text="🗑 Удалить юзера"), KeyboardButton(text="💿 Все релизы")],
+            [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🎤 Артисты")],
+            [KeyboardButton(text="➕ Добавить юзера"), KeyboardButton(text="💿 Все релизы")],
             [KeyboardButton(text="💿 Создать релиз"), KeyboardButton(text="➕ Создать задачу")],
             [KeyboardButton(text="📋 Активные задачи"), KeyboardButton(text="📜 История всех задач")]
         ]
     elif role == 'anr':
         kb = [
-            [KeyboardButton(text="💿 Создать релиз"), KeyboardButton(text="💿 Мои релизы")],
-            [KeyboardButton(text="➕ Создать задачу"), KeyboardButton(text="📋 Мои задачи")],
-            [KeyboardButton(text="📜 История")]
+            [KeyboardButton(text="💿 Создать релиз"), KeyboardButton(text="🎤 Артисты")],
+            [KeyboardButton(text="💿 Мои релизы"), KeyboardButton(text="➕ Создать задачу")],
+            [KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="📜 История")]
         ]
     elif role == 'designer':
         kb = [[KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="📜 История")], [KeyboardButton(text="🕰 Просроченные")]]

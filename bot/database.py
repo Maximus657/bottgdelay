@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import datetime
 from bot.config import DATABASE_URL, ADMIN_IDS
 
 logger = logging.getLogger(__name__)
@@ -270,16 +271,24 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM artists WHERE flag_contract=0")
 
-    async def update_artist_flag(self, artist_id, column):
+    async def update_artist_flag(self, artist_id, column, value=1):
         async with self.pool.acquire() as conn:
             # Внимание: имя колонки передается динамически, нужно быть осторожным.
             # Но здесь мы контролируем ввод из кода.
             # asyncpg не поддерживает динамические имена колонок в параметрах, поэтому f-string.
-            await conn.execute(f"UPDATE artists SET {column}=1 WHERE id=$1", artist_id)
+            await conn.execute(f"UPDATE artists SET {column}=$1 WHERE id=$2", value, artist_id)
             
     async def get_artist_by_name(self, name):
          async with self.pool.acquire() as conn:
             return await conn.fetchrow("SELECT id FROM artists WHERE name=$1", name)
+
+    async def get_artist_by_id(self, aid):
+         async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM artists WHERE id=$1", aid)
+
+    async def get_all_artists(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM artists ORDER BY name")
 
     async def create_artist(self, name, manager_id, first_release_date):
         async with self.pool.acquire() as conn:
@@ -295,6 +304,23 @@ class Database:
                 title, artist_id, r_type, release_date, created_by
             )
             
+    async def get_artists_by_flag(self, flag_column, flag_value=0):
+        """Получает артистов по значению определенного флага."""
+        async with self.pool.acquire() as conn:
+            # Используем f-string для имени колонки, так как asyncpg не позволяет это в параметрах
+            return await conn.fetch(f"SELECT * FROM artists WHERE {flag_column}=$1", flag_value)
+
+    async def get_upcoming_releases(self, days_ahead):
+        """Получает релизы, которые выйдут через указанное количество дней."""
+        target_date = (datetime.date.today() + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM releases WHERE release_date=$1", target_date)
+            
+    async def get_release_pitching_task(self, release_id):
+        """Ищет задачу на питчинг для релиза."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM tasks WHERE release_id=$1 AND title LIKE '📝 Питчинг%'", release_id)
+
     async def get_designer(self):
         async with self.pool.acquire() as conn:
              return await conn.fetchrow("SELECT telegram_id FROM users WHERE role='designer'")

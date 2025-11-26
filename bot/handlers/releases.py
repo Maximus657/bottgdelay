@@ -11,7 +11,7 @@ from bot.config import ROLES_DISPLAY
 
 router = Router()
 
-async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name, need_cover):
+async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name, need_cover, r_type):
     """Генерация стандартных задач для релиза."""
     designer = await db.get_designer()
     
@@ -23,14 +23,29 @@ async def generate_release_tasks(rel_id, title, r_date, manager_id, artist_name,
         designer_note = " (Fallback: нет дизайнера)"
 
     tasks = []
+    
+    # --- ОБЩИЕ ЗАДАЧИ ---
     if need_cover: tasks.append(("🎨 Обложка", f"Сделать обложку: {artist_name} - {title}{designer_note}", designer_id, 14, 1))
     tasks.append(("📤 Дистрибуция", f"Загрузить трек: {artist_name} - {title}", manager_id, 10, 0))
     tasks.append(("📝 Питчинг", f"Форма питчинга: {artist_name} - {title}", manager_id, 7, 0))
     tasks.append(("📱 Сниппет", f"Видео-сниппет: {artist_name} - {title}{designer_note}", designer_id, 3, 1))
     
+    # --- СПЕЦИФИЧНЫЕ ЗАДАЧИ ДЛЯ АЛЬБОМА ---
+    if r_type == "Альбом":
+        tasks.append(("📋 Треклист", f"Утвердить финальный треклист: {artist_name} - {title}", manager_id, 30, 0))
+        tasks.append(("📀 Мета-данные", f"Проверить мета-данные всех треков: {artist_name} - {title}", manager_id, 20, 0))
+        tasks.append(("📢 Промо-план", f"Составить план продвижения альбома: {artist_name} - {title}", manager_id, 15, 0))
+    
     r_dt = datetime.datetime.strptime(r_date, "%Y-%m-%d")
     for t_name, t_desc, assignee, days, req in tasks:
-        dl = (r_dt - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        # Если дней больше чем осталось до релиза, ставим дедлайн на сегодня
+        days_delta = datetime.timedelta(days=days)
+        target_date = r_dt - days_delta
+        if target_date < datetime.datetime.now():
+            dl = datetime.datetime.now().strftime("%Y-%m-%d")
+        else:
+            dl = target_date.strftime("%Y-%m-%d")
+            
         await db.create_task(f"{t_name} | {artist_name}", t_desc, assignee, manager_id, rel_id, dl, req)
 
 @router.message(F.text == "💿 Создать релиз")
@@ -93,7 +108,7 @@ async def create_release_finish(m: types.Message, state: FSMContext):
     # Создаем релиз
     rel_id = await db.create_release(data['title'], artist_id, data['type'], clean_date, manager_id)
     
-    await generate_release_tasks(rel_id, data['title'], clean_date, manager_id, data['artist'], data['need_cover'])
+    await generate_release_tasks(rel_id, data['title'], clean_date, manager_id, data['artist'], data['need_cover'], data['type'])
     
     user = await db.get_user(manager_id)
     await m.answer(f"🚀 <b>Релиз создан!</b>\n🎶 {data['artist']} — {data['title']}", reply_markup=get_main_kb(user['role']), parse_mode="HTML")

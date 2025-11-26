@@ -6,6 +6,12 @@ class AddUser(StatesGroup):
     name = State()
     role = State()
 
+class CreateArtist(StatesGroup):
+    """Состояния для добавления артиста."""
+    name = State()
+    manager = State()
+    date = State()
+
 class CreateRelease(StatesGroup):
     """Состояния для создания релиза."""
     artist_str = State()
